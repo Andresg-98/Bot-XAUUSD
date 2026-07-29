@@ -11,6 +11,12 @@ class ImpactLevel(str, Enum):
     BAJO = "bajo"
 
 
+class SignalDirection(str, Enum):
+    LONG = "long"
+    SHORT = "short"
+    NONE = "none"
+
+
 @dataclass(frozen=True)
 class MacroEvent:
     """Evento macro normalizado, ver 'Output esperado del módulo' en spec_bot_xauusd.md 4.1."""
