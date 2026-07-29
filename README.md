@@ -221,6 +221,25 @@ cada tick, como prohíbe explícitamente la spec. **El calendario de
 ForexFactory se cachea con refresco cada 180s** (`intervalo_macro_segundos`),
 separado del intervalo de monitoreo — corriendo el bot en vivo descubrimos
 que pedirlo cada 45s hace que el feed gratuito devuelva `429 Rate Limited`.
+Un segundo bug relacionado (también encontrado en vivo): si el intento
+fallaba, la marca de "último intento" nunca se actualizaba, así que cada
+tick de 45s reintentaba de inmediato en vez de esperar los 180s — una
+tormenta de reintentos que empeoraba el bloqueo. Ya corregido: la marca se
+actualiza haya éxito o no.
+
+**Redistribución de peso cuando el macro no tiene nada que aportar
+(`DecisionConfig.redistribuir_peso_si_macro_vacio`):** con los pesos por
+defecto (0.5/0.5), si el macro da score 0.0 porque ninguna regla encontró un
+evento relevante activo (que es la mayoría del tiempo — un evento de alto
+impacto no está pasando en cualquier momento dado), el técnico solo puede
+empatar el umbral exacto, nunca superarlo — el bot en vivo casi nunca
+dispararía una señal. `run_paper_trading.py` y `check_decision_engine.py`
+activan esta opción: cuando el macro no encontró ningún evento relevante
+este ciclo (no solo "score 0", sino cero reglas activas), su peso se
+redistribuye 100% al técnico solo para ese ciclo. Si el macro SÍ tiene
+reglas activas (aunque su score neto sea 0 porque se cancelan entre sí), se
+respeta el peso configurado normalmente — el macro real nunca se ignora
+cuando sí está aportando algo.
 
 **Lotaje manual (`MT5_LOTE_FIJO`, opcional):** por defecto el tamaño de cada
 entrada se calcula automáticamente por riesgo % + distancia de SL en ATR
