@@ -257,3 +257,42 @@ class Mt5Broker:
             return OrderResult(False, None, lotes, precio, sl, tp, motivo, False)
 
         return OrderResult(True, resultado.order, lotes, resultado.price, sl, tp, None, False)
+
+    def close_position(self, symbol: str, ticket: int, comentario: str = "cierre_manual") -> OrderResult:
+        """Cierra una posición abierta manualmente con una orden de mercado en
+        sentido contrario. No es parte de la lógica automática de entradas del
+        bot (spec 4.4/4.5) — es una acción operativa explícita del usuario."""
+        posicion = next(iter(mt5.positions_get(ticket=ticket) or []), None)
+        if posicion is None:
+            return OrderResult(False, None, None, None, None, None, f"No se encontró la posición {ticket}.", self.dry_run)
+
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return OrderResult(False, None, None, None, None, None, "No se pudo leer el precio actual.", self.dry_run)
+
+        es_compra = posicion.type == mt5.ORDER_TYPE_BUY
+        precio_cierre = tick.bid if es_compra else tick.ask
+
+        if self.dry_run:
+            return OrderResult(True, ticket, posicion.volume, precio_cierre, posicion.sl, posicion.tp, None, True)
+
+        info = mt5.symbol_info(symbol)
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": posicion.volume,
+            "type": mt5.ORDER_TYPE_SELL if es_compra else mt5.ORDER_TYPE_BUY,
+            "position": ticket,
+            "price": precio_cierre,
+            "deviation": 20,
+            "magic": self.MAGIC,
+            "comment": comentario,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": self._resolver_filling(info) if info is not None else mt5.ORDER_FILLING_RETURN,
+        }
+        resultado = mt5.order_send(request)
+        if resultado is None or resultado.retcode != mt5.TRADE_RETCODE_DONE:
+            motivo = f"retcode={getattr(resultado, 'retcode', None)} comment={getattr(resultado, 'comment', mt5.last_error())}"
+            return OrderResult(False, None, posicion.volume, precio_cierre, posicion.sl, posicion.tp, motivo, False)
+
+        return OrderResult(True, resultado.order, posicion.volume, resultado.price, posicion.sl, posicion.tp, None, False)

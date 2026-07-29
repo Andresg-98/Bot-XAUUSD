@@ -60,7 +60,9 @@ class FakeMt5:
     def account_info(self):
         return self.account
 
-    def positions_get(self, symbol: str):
+    def positions_get(self, symbol: str = None, ticket: int = None):
+        if ticket is not None:
+            return [p for p in self.positiciones if p.ticket == ticket]
         return [p for p in self.positiciones if p.symbol == symbol]
 
     def order_send(self, request: dict):
@@ -307,3 +309,50 @@ def test_update_stop_loss_reports_failure(monkeypatch: pytest.MonkeyPatch) -> No
     exito = broker.update_stop_loss("XAUUSD!", ticket=99, nuevo_sl=2000.0, tp_actual=2020.0)
 
     assert exito is False
+
+
+def test_close_position_not_found_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeMt5()
+    broker = connected_broker(monkeypatch, fake, dry_run=True)
+
+    resultado = broker.close_position("XAUUSD!", ticket=999)
+
+    assert resultado.enviada is False
+    assert "no se encontró" in resultado.motivo_rechazo.lower()
+
+
+def test_close_position_dry_run_never_calls_order_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeMt5()
+    fake.positiciones = [SimpleNamespace(symbol="XAUUSD!", ticket=7, type=FakeMt5.ORDER_TYPE_SELL, volume=0.15, sl=2010.0, tp=1990.0)]
+    broker = connected_broker(monkeypatch, fake, dry_run=True)
+
+    resultado = broker.close_position("XAUUSD!", ticket=7)
+
+    assert resultado.enviada is True
+    assert resultado.dry_run is True
+    assert fake.ultima_request is None
+
+
+def test_close_position_live_closes_a_short_with_a_buy_deal(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeMt5()
+    fake.positiciones = [SimpleNamespace(symbol="XAUUSD!", ticket=7, type=FakeMt5.ORDER_TYPE_SELL, volume=0.15, sl=2010.0, tp=1990.0)]
+    broker = connected_broker(monkeypatch, fake, dry_run=False)
+
+    resultado = broker.close_position("XAUUSD!", ticket=7)
+
+    assert resultado.enviada is True
+    assert fake.ultima_request["type"] == FakeMt5.ORDER_TYPE_BUY  # opuesto a la posición SHORT
+    assert fake.ultima_request["position"] == 7
+    assert fake.ultima_request["volume"] == 0.15
+
+
+def test_close_position_reports_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeMt5()
+    fake.positiciones = [SimpleNamespace(symbol="XAUUSD!", ticket=7, type=FakeMt5.ORDER_TYPE_BUY, volume=0.1, sl=1990.0, tp=2020.0)]
+    fake.orden_a_devolver = SimpleNamespace(retcode=10004, order=None, price=None, comment="requote")
+    broker = connected_broker(monkeypatch, fake, dry_run=False)
+
+    resultado = broker.close_position("XAUUSD!", ticket=7)
+
+    assert resultado.enviada is False
+    assert "10004" in resultado.motivo_rechazo
