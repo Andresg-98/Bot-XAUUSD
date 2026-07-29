@@ -34,10 +34,12 @@ class FakeMt5:
 def make_settings(**overrides: object) -> Settings:
     base = dict(
         fred_api_key=None,
+        twelvedata_api_key=None,
         mt5_login=1,
         mt5_password="pw",
         mt5_server="srv",
         mt5_terminal_path=None,
+        mt5_symbol="XAUUSD",
     )
     base.update(overrides)
     return Settings(**base)

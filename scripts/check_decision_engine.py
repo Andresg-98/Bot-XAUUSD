@@ -15,10 +15,8 @@ from bot_xauusd.signals.decision_engine import DecisionEngine  # noqa: E402
 
 def main() -> None:
     settings = load_settings()
-    if not settings.mt5_login:
-        print("Falta MT5_LOGIN/MT5_PASSWORD/MT5_SERVER. Copia .env.example a .env y completa tus credenciales.")
-        return
-
+    # Si no hay credenciales en .env, mt5.initialize() intenta adjuntarse a una
+    # terminal MT5 ya abierta y logueada — no siempre hace falta login/password/server.
     try:
         eventos = ForexFactoryClient().get_calendar("this_week")
     except ForexFactoryApiError as exc:
@@ -27,8 +25,8 @@ def main() -> None:
 
     try:
         with Mt5PriceClient(settings) as client:
-            h4_bars = client.get_bars("XAUUSD", "H4", count=250)
-            h1_bars = client.get_bars("XAUUSD", "H1", count=250)
+            h4_bars = client.get_bars(settings.mt5_symbol, "H4", count=250)
+            h1_bars = client.get_bars(settings.mt5_symbol, "H1", count=250)
     except Mt5ConnectionError as exc:
         print(f"Error de conexión MT5: {exc}")
         return

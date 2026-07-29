@@ -12,14 +12,12 @@ from bot_xauusd.ingestion.price_mt5 import Mt5ConnectionError, Mt5PriceClient  #
 
 def main() -> None:
     settings = load_settings()
-    if not settings.mt5_login:
-        print("Falta MT5_LOGIN/MT5_PASSWORD/MT5_SERVER. Copia .env.example a .env y completa tus credenciales.")
-        return
-
+    # Si no hay credenciales en .env, mt5.initialize() intenta adjuntarse a una
+    # terminal MT5 ya abierta y logueada — no siempre hace falta login/password/server.
     try:
         with Mt5PriceClient(settings) as client:
             for timeframe in ("H4", "H1"):
-                barras = client.get_bars("XAUUSD", timeframe, count=5)
+                barras = client.get_bars(settings.mt5_symbol, timeframe, count=5)
                 print(f"--- {timeframe}: últimas {len(barras)} velas ---")
                 for bar in barras:
                     print(f"{bar.time} O={bar.open} H={bar.high} L={bar.low} C={bar.close} V={bar.volume}")
