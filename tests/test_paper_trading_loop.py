@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from bot_xauusd.backtest.risk import RiskConfig
 from bot_xauusd.live.decision_log import DecisionLogger
-from bot_xauusd.live.loop import LoopState, debe_evaluar, ejecutar_ciclo
+from bot_xauusd.live.loop import LoopState, _obtener_eventos_macro, debe_evaluar, ejecutar_ciclo
 from bot_xauusd.live.state import KillSwitchStateStore
 from bot_xauusd.models import ImpactLevel, MacroEvent, PriceBar, SignalDirection
 from bot_xauusd.signals.decision_engine import Signal
@@ -100,8 +100,13 @@ class _FakeOrderResult:
 
 
 class FakeMacroClient:
+    def __init__(self, eventos: list | None = None) -> None:
+        self._eventos = eventos or []
+        self.llamadas = 0
+
     def get_calendar(self, window: str = "this_week"):
-        return []
+        self.llamadas += 1
+        return self._eventos
 
 
 class FakePriceClient:
@@ -212,3 +217,53 @@ def test_when_not_time_to_evaluate_no_order_and_no_evaluation_log(tmp_path: Path
     assert broker.ordenes_enviadas == []
     registros = read_log(tmp_path / "decisiones.jsonl")
     assert not any(r["tipo"] == "evaluacion" for r in registros)
+
+
+# --- throttling del calendario macro ---------------------------------------------------
+# Se agregó tras correr el bot en vivo: pedir el feed de ForexFactory en cada tick de
+# monitoreo (cada 45s) lo satura y empieza a devolver 429 Rate Limited.
+
+
+def test_macro_calendar_is_not_refetched_within_the_throttle_window(tmp_path: Path) -> None:
+    macro_client = FakeMacroClient()
+    logger = DecisionLogger(tmp_path / "decisiones.jsonl")
+    loop_state = LoopState()
+    momento = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+
+    eventos_1 = _obtener_eventos_macro(momento, loop_state, macro_client, logger, intervalo_macro_segundos=180)
+    eventos_2 = _obtener_eventos_macro(
+        momento + timedelta(seconds=45), loop_state, macro_client, logger, intervalo_macro_segundos=180
+    )
+
+    assert macro_client.llamadas == 1
+    assert eventos_1 == eventos_2
+
+
+def test_macro_calendar_is_refetched_after_the_throttle_window_expires(tmp_path: Path) -> None:
+    macro_client = FakeMacroClient()
+    logger = DecisionLogger(tmp_path / "decisiones.jsonl")
+    loop_state = LoopState()
+    momento = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+
+    _obtener_eventos_macro(momento, loop_state, macro_client, logger, intervalo_macro_segundos=180)
+    _obtener_eventos_macro(
+        momento + timedelta(seconds=200), loop_state, macro_client, logger, intervalo_macro_segundos=180
+    )
+
+    assert macro_client.llamadas == 2
+
+
+def test_ejecutar_ciclo_reuses_cached_macro_events_across_calls(tmp_path: Path) -> None:
+    macro_client = FakeMacroClient()
+    loop_state = LoopState()
+    momento = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+
+    kwargs = make_ciclo_kwargs(tmp_path, macro_client=macro_client, loop_state=loop_state, momento=momento)
+    ejecutar_ciclo(**kwargs)
+
+    kwargs2 = make_ciclo_kwargs(
+        tmp_path, macro_client=macro_client, loop_state=loop_state, momento=momento + timedelta(seconds=45)
+    )
+    ejecutar_ciclo(**kwargs2)
+
+    assert macro_client.llamadas == 1

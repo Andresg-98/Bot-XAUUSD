@@ -15,16 +15,23 @@ from .decision_log import DecisionLogger
 from .state import KillSwitchStateStore, evaluar_kill_switches
 
 HISTORIAL_MINIMO = 250
+INTERVALO_MACRO_SEGUNDOS_DEFECTO = 180
 
 
 @dataclass
 class LoopState:
     """Estado en memoria del ciclo (spec 4.8): cuándo fue la última evaluación
-    por cierre de H1, y qué eventos de alto impacto ya dispararon una
-    re-evaluación (para no repetir la misma reacción varias veces)."""
+    por cierre de H1, qué eventos de alto impacto ya dispararon una
+    re-evaluación (para no repetir la misma reacción varias veces), y el
+    calendario macro cacheado para no re-consultar el feed en cada tick de
+    monitoreo (ver `ejecutar_ciclo`: el feed de ForexFactory es un servicio
+    gratuito no oficial que empieza a devolver 429 si se le pide demasiado
+    seguido — se descubrió corriendo el bot en vivo)."""
 
     ultima_hora_evaluada: str | None = None
     eventos_alto_impacto_vistos: set[tuple[str, str, str]] = field(default_factory=set)
+    eventos_cache: list[MacroEvent] = field(default_factory=list)
+    ultima_consulta_macro: datetime | None = None
 
 
 def _hora_bucket(momento: datetime) -> str:
@@ -42,6 +49,30 @@ def _detectar_eventos_alto_impacto_nuevos(
                 nuevos.append(e)
                 vistos.add(clave)
     return nuevos
+
+
+def _obtener_eventos_macro(
+    momento: datetime,
+    loop_state: LoopState,
+    macro_client: ForexFactoryClient,
+    logger: DecisionLogger,
+    intervalo_macro_segundos: int,
+) -> list[MacroEvent]:
+    """Reutiliza el calendario cacheado salvo que ya haya pasado
+    `intervalo_macro_segundos` desde la última consulta real al feed."""
+    vencido = (
+        loop_state.ultima_consulta_macro is None
+        or (momento - loop_state.ultima_consulta_macro).total_seconds() >= intervalo_macro_segundos
+    )
+    if not vencido:
+        return loop_state.eventos_cache
+
+    try:
+        loop_state.eventos_cache = macro_client.get_calendar("this_week")
+        loop_state.ultima_consulta_macro = momento
+    except ForexFactoryApiError as exc:
+        logger.log_evento("error_macro", str(exc))
+    return loop_state.eventos_cache
 
 
 def debe_evaluar(momento: datetime, loop_state: LoopState, eventos: Sequence[MacroEvent]) -> tuple[bool, str]:
@@ -74,6 +105,7 @@ def ejecutar_ciclo(
     logger: DecisionLogger,
     state_store: KillSwitchStateStore,
     loop_state: LoopState,
+    intervalo_macro_segundos: int = INTERVALO_MACRO_SEGUNDOS_DEFECTO,
 ) -> None:
     """Un ciclo de monitoreo (spec 4.8): siempre revisa kill switches; solo
     evalúa una nueva señal si corresponde (ver `debe_evaluar`)."""
@@ -82,11 +114,7 @@ def ejecutar_ciclo(
     if motivo_halt:
         logger.log_evento("kill_switch_permanente", motivo_halt)
 
-    try:
-        eventos = macro_client.get_calendar("this_week")
-    except ForexFactoryApiError as exc:
-        logger.log_evento("error_macro", str(exc))
-        eventos = []
+    eventos = _obtener_eventos_macro(momento, loop_state, macro_client, logger, intervalo_macro_segundos)
 
     evaluar, motivo = debe_evaluar(momento, loop_state, eventos)
     if not evaluar:
@@ -159,6 +187,7 @@ def run_forever(
     logger: DecisionLogger,
     state_store: KillSwitchStateStore,
     intervalo_monitoreo_segundos: int = 45,
+    intervalo_macro_segundos: int = INTERVALO_MACRO_SEGUNDOS_DEFECTO,
 ) -> None:  # pragma: no cover - loop infinito, probado vía ejecutar_ciclo()
     """Loop principal de paper trading. Solo se detiene con Ctrl+C."""
     loop_state = LoopState()
@@ -176,6 +205,7 @@ def run_forever(
                 logger=logger,
                 state_store=state_store,
                 loop_state=loop_state,
+                intervalo_macro_segundos=intervalo_macro_segundos,
             )
         except Exception as exc:  # noqa: BLE001 - un ciclo fallido no debe tumbar 4-8 semanas de ejecución
             logger.log_evento("error_ciclo", f"{type(exc).__name__}: {exc}")
