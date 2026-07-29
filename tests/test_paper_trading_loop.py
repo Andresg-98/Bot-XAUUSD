@@ -100,12 +100,17 @@ class _FakeOrderResult:
 
 
 class FakeMacroClient:
-    def __init__(self, eventos: list | None = None) -> None:
+    def __init__(self, eventos: list | None = None, fallar: bool = False) -> None:
         self._eventos = eventos or []
+        self.fallar = fallar
         self.llamadas = 0
 
     def get_calendar(self, window: str = "this_week"):
         self.llamadas += 1
+        if self.fallar:
+            from bot_xauusd.ingestion.macro_forexfactory import ForexFactoryApiError
+
+            raise ForexFactoryApiError("429 simulado")
         return self._eventos
 
 
@@ -293,3 +298,24 @@ def test_signal_uses_risk_based_sizing_when_no_fixed_lot_configured(tmp_path: Pa
     _symbol, _direccion, _sl, _tp, tamano_unidades, lotes = broker.ordenes_enviadas[0]
     assert lotes is None
     assert tamano_unidades is not None
+
+
+# --- resiliencia ante fallas del feed macro (evita tormenta de reintentos) ----------------
+
+
+def test_failed_macro_fetch_still_respects_the_throttle_window(tmp_path: Path) -> None:
+    macro_client = FakeMacroClient(fallar=True)
+    logger = DecisionLogger(tmp_path / "decisiones.jsonl")
+    loop_state = LoopState()
+    momento = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+
+    _obtener_eventos_macro(momento, loop_state, macro_client, logger, intervalo_macro_segundos=180)
+    _obtener_eventos_macro(
+        momento + timedelta(seconds=45), loop_state, macro_client, logger, intervalo_macro_segundos=180
+    )
+
+    # Aunque la 1ra falló, la 2da (45s despues) NO debe reintentar todavía —
+    # de lo contrario, cada tick de monitoreo martillaría el feed sin parar.
+    assert macro_client.llamadas == 1
+    registros = read_log(tmp_path / "decisiones.jsonl")
+    assert sum(1 for r in registros if r["tipo"] == "error_macro") == 1

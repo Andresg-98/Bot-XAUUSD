@@ -21,6 +21,18 @@ class DecisionConfig:
     peso_tecnico: float = 0.5
     umbral_compra: float = 0.5
     umbral_venta: float = -0.5
+    redistribuir_peso_si_macro_vacio: bool = False
+    """
+    Si es True: en los ciclos donde ninguna regla macro encontró un evento
+    relevante (`macro.resultados` vacío — no es lo mismo que "score 0 con
+    reglas activas que se cancelan entre sí"), el peso de `peso_macro` se
+    redistribuye por completo a `peso_tecnico` SOLO para ese ciclo. Sin esto,
+    con los pesos por defecto (0.5/0.5) el técnico nunca puede superar
+    estrictamente el umbral por sí solo — se queda empatado exactamente en
+    él — así que en la práctica el bot nunca operaría en los (frecuentes)
+    ciclos sin un evento macro activo. Por defecto False para no cambiar el
+    comportamiento ya probado; el bot en vivo lo activa explícitamente.
+    """
 
 
 @dataclass(frozen=True)
@@ -66,10 +78,17 @@ class DecisionEngine:
         macro = self._macro_engine.evaluate(macro_events)
         tecnico = self._technical_engine.evaluate(h4_bars, h1_bars)
 
-        score_final = config.peso_macro * macro.score + config.peso_tecnico * tecnico.score
+        peso_macro, peso_tecnico = config.peso_macro, config.peso_tecnico
+        redistribuido = config.redistribuir_peso_si_macro_vacio and not macro.resultados
+        if redistribuido:
+            peso_tecnico = peso_macro + peso_tecnico
+            peso_macro = 0.0
+
+        score_final = peso_macro * macro.score + peso_tecnico * tecnico.score
         razones = [
-            f"Score macro={macro.score:+.2f} (peso {config.peso_macro}), "
-            f"score técnico={tecnico.score:+.2f} (peso {config.peso_tecnico}) => señal_final={score_final:+.2f}",
+            f"Score macro={macro.score:+.2f} (peso {peso_macro}), "
+            f"score técnico={tecnico.score:+.2f} (peso {peso_tecnico}) => señal_final={score_final:+.2f}",
+            *(["Sin eventos macro relevantes este ciclo — peso redistribuido 100% al técnico."] if redistribuido else []),
             *[f"[macro] {r.regla}: {r.razon} (score={r.score:+.2f}, peso={r.peso})" for r in macro.resultados],
             *tecnico.razones,
         ]

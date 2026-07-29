@@ -20,7 +20,7 @@ from bot_xauusd.ingestion.price_mt5 import Mt5ConnectionError, Mt5PriceClient  #
 from bot_xauusd.live.decision_log import DecisionLogger  # noqa: E402
 from bot_xauusd.live.loop import run_forever  # noqa: E402
 from bot_xauusd.live.state import KillSwitchStateStore  # noqa: E402
-from bot_xauusd.signals.decision_engine import DecisionEngine  # noqa: E402
+from bot_xauusd.signals.decision_engine import DecisionConfig, DecisionEngine  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -54,7 +54,7 @@ def main() -> None:
             broker=broker,
             macro_client=ForexFactoryClient(),
             price_client=price_client,
-            decision_engine=DecisionEngine(),
+            decision_engine=DecisionEngine(config=DecisionConfig(redistribuir_peso_si_macro_vacio=True)),
             risk=RiskConfig(),
             logger=logger,
             state_store=state_store,

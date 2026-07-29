@@ -3,13 +3,13 @@ from __future__ import annotations
 from bot_xauusd.models import SignalDirection
 from bot_xauusd.signals.decision_engine import DecisionConfig, DecisionEngine
 from bot_xauusd.signals.indicators import TrendDirection
-from bot_xauusd.signals.macro_rules import MacroScoreResult
+from bot_xauusd.signals.macro_rules import MacroScoreResult, RuleResult
 from bot_xauusd.signals.technical_trend import TechnicalScoreResult
 
 
 class FakeMacroEngine:
-    def __init__(self, score: float) -> None:
-        self._resultado = MacroScoreResult(score=score, resultados=[])
+    def __init__(self, score: float, resultados: list[RuleResult] | None = None) -> None:
+        self._resultado = MacroScoreResult(score=score, resultados=resultados or [])
 
     def evaluate(self, eventos):
         return self._resultado
@@ -90,3 +90,54 @@ def test_signal_carries_reasoning_for_logging() -> None:
     señal = engine.evaluate([], [], [])
     assert len(señal.razones) > 0
     assert any("señal_final" in razon for razon in señal.razones)
+
+
+# --- redistribuir_peso_si_macro_vacio -------------------------------------------------
+
+
+def test_without_redistribution_technical_alone_ties_the_threshold_and_does_not_trade() -> None:
+    # Con pesos 50/50 y macro en 0 (sin reglas activas), el técnico solo llega
+    # exactamente al umbral (-0.5), nunca lo supera -- comportamiento heredado,
+    # confirmado aquí para dejar constancia del "bug" que motivó la opción.
+    config = DecisionConfig(peso_macro=0.5, peso_tecnico=0.5, umbral_compra=0.5, umbral_venta=-0.5)
+    engine = DecisionEngine(
+        macro_engine=FakeMacroEngine(score=0.0, resultados=[]),
+        technical_engine=FakeTechnicalEngine(-1.0, TrendDirection.BAJISTA),
+        config=config,
+    )
+    señal = engine.evaluate([], [], [])
+    assert señal.score_final == -0.5
+    assert señal.direccion == SignalDirection.NONE
+
+
+def test_redistribution_lets_pure_technical_signal_cross_the_threshold() -> None:
+    config = DecisionConfig(
+        peso_macro=0.5, peso_tecnico=0.5, umbral_compra=0.5, umbral_venta=-0.5, redistribuir_peso_si_macro_vacio=True
+    )
+    engine = DecisionEngine(
+        macro_engine=FakeMacroEngine(score=0.0, resultados=[]),
+        technical_engine=FakeTechnicalEngine(-1.0, TrendDirection.BAJISTA),
+        config=config,
+    )
+    señal = engine.evaluate([], [], [])
+    assert señal.score_final == -1.0  # 100% del peso quedó en el técnico
+    assert señal.direccion == SignalDirection.SHORT
+    assert any("redistribuido" in r for r in señal.razones)
+
+
+def test_redistribution_does_not_apply_when_macro_has_active_rules() -> None:
+    # Aunque el score macro dé 0.0 (reglas que se cancelan entre sí), si SÍ hubo
+    # reglas activas (resultados no vacío) no se redistribuye -- el macro real
+    # sigue contando con su peso normal, no se descarta.
+    config = DecisionConfig(
+        peso_macro=0.5, peso_tecnico=0.5, umbral_compra=0.5, umbral_venta=-0.5, redistribuir_peso_si_macro_vacio=True
+    )
+    resultados = [RuleResult(regla="regla_x", score=0.0, peso=1.0, razon="cancelada")]
+    engine = DecisionEngine(
+        macro_engine=FakeMacroEngine(score=0.0, resultados=resultados),
+        technical_engine=FakeTechnicalEngine(-1.0, TrendDirection.BAJISTA),
+        config=config,
+    )
+    señal = engine.evaluate([], [], [])
+    assert señal.score_final == -0.5  # pesos normales, no redistribuidos
+    assert señal.direccion == SignalDirection.NONE

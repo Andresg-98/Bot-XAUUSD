@@ -59,7 +59,11 @@ def _obtener_eventos_macro(
     intervalo_macro_segundos: int,
 ) -> list[MacroEvent]:
     """Reutiliza el calendario cacheado salvo que ya haya pasado
-    `intervalo_macro_segundos` desde la última consulta real al feed."""
+    `intervalo_macro_segundos` desde el último INTENTO (haya tenido éxito o
+    no). Marcar `ultima_consulta_macro` solo en el caso exitoso causaba una
+    tormenta de reintentos: tras un 429, cada tick de 45s volvía a intentar
+    de inmediato en vez de esperar la ventana completa — descubierto
+    corriendo el bot en vivo."""
     vencido = (
         loop_state.ultima_consulta_macro is None
         or (momento - loop_state.ultima_consulta_macro).total_seconds() >= intervalo_macro_segundos
@@ -67,9 +71,9 @@ def _obtener_eventos_macro(
     if not vencido:
         return loop_state.eventos_cache
 
+    loop_state.ultima_consulta_macro = momento
     try:
         loop_state.eventos_cache = macro_client.get_calendar("this_week")
-        loop_state.ultima_consulta_macro = momento
     except ForexFactoryApiError as exc:
         logger.log_evento("error_macro", str(exc))
     return loop_state.eventos_cache

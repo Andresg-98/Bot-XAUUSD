@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from bot_xauusd.config import load_settings  # noqa: E402
 from bot_xauusd.ingestion.macro_forexfactory import ForexFactoryApiError, ForexFactoryClient  # noqa: E402
 from bot_xauusd.ingestion.price_mt5 import Mt5ConnectionError, Mt5PriceClient  # noqa: E402
-from bot_xauusd.signals.decision_engine import DecisionEngine  # noqa: E402
+from bot_xauusd.signals.decision_engine import DecisionConfig, DecisionEngine  # noqa: E402
 
 
 def main() -> None:
@@ -31,7 +31,10 @@ def main() -> None:
         print(f"Error de conexión MT5: {exc}")
         return
 
-    señal = DecisionEngine().evaluate(eventos, h4_bars, h1_bars)
+    # Misma config que usa run_paper_trading.py: si el macro no tiene eventos
+    # relevantes activos, su peso se redistribuye al técnico (ver decision_engine.py).
+    config = DecisionConfig(redistribuir_peso_si_macro_vacio=True)
+    señal = DecisionEngine(config=config).evaluate(eventos, h4_bars, h1_bars)
 
     print(f"Dirección: {señal.direccion.value.upper()} | señal_final={señal.score_final:+.2f}")
     print(f"Score macro: {señal.macro.score:+.2f} | Score técnico: {señal.tecnico.score:+.2f}")
