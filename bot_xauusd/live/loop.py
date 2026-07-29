@@ -1,0 +1,182 @@
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Sequence
+
+from ..backtest.risk import RiskConfig
+from ..execution.mt5_broker import Mt5Broker
+from ..ingestion.macro_forexfactory import ForexFactoryApiError, ForexFactoryClient
+from ..ingestion.price_mt5 import Mt5ConnectionError, Mt5PriceClient
+from ..models import ImpactLevel, MacroEvent, SignalDirection
+from ..signals.decision_engine import DecisionEngine
+from .decision_log import DecisionLogger
+from .state import KillSwitchStateStore, evaluar_kill_switches
+
+HISTORIAL_MINIMO = 250
+
+
+@dataclass
+class LoopState:
+    """Estado en memoria del ciclo (spec 4.8): cuándo fue la última evaluación
+    por cierre de H1, y qué eventos de alto impacto ya dispararon una
+    re-evaluación (para no repetir la misma reacción varias veces)."""
+
+    ultima_hora_evaluada: str | None = None
+    eventos_alto_impacto_vistos: set[tuple[str, str, str]] = field(default_factory=set)
+
+
+def _hora_bucket(momento: datetime) -> str:
+    return momento.strftime("%Y-%m-%dT%H")
+
+
+def _detectar_eventos_alto_impacto_nuevos(
+    eventos: Sequence[MacroEvent], vistos: set[tuple[str, str, str]]
+) -> list[MacroEvent]:
+    nuevos = []
+    for e in eventos:
+        if e.impacto == ImpactLevel.ALTO and e.valor_real is not None:
+            clave = (e.evento, e.pais, e.fecha.isoformat())
+            if clave not in vistos:
+                nuevos.append(e)
+                vistos.add(clave)
+    return nuevos
+
+
+def debe_evaluar(momento: datetime, loop_state: LoopState, eventos: Sequence[MacroEvent]) -> tuple[bool, str]:
+    """
+    Dos disparadores posibles de evaluación (spec 4.8), independientes del
+    monitoreo continuo: cierre de vela H1, o publicación de un evento macro de
+    alto impacto. Nunca se evalúa en cada tick — eso es exactamente lo que
+    prohíbe la spec ("sobre-operación y ruido").
+    """
+    nuevos = _detectar_eventos_alto_impacto_nuevos(eventos, loop_state.eventos_alto_impacto_vistos)
+    if nuevos:
+        return True, f"evento macro de alto impacto publicado: {', '.join(e.evento for e in nuevos)}"
+
+    hora_actual = _hora_bucket(momento)
+    if loop_state.ultima_hora_evaluada != hora_actual:
+        return True, "cierre de vela H1"
+
+    return False, ""
+
+
+def ejecutar_ciclo(
+    *,
+    momento: datetime,
+    symbol: str,
+    broker: Mt5Broker,
+    macro_client: ForexFactoryClient,
+    price_client: Mt5PriceClient,
+    decision_engine: DecisionEngine,
+    risk: RiskConfig,
+    logger: DecisionLogger,
+    state_store: KillSwitchStateStore,
+    loop_state: LoopState,
+) -> None:
+    """Un ciclo de monitoreo (spec 4.8): siempre revisa kill switches; solo
+    evalúa una nueva señal si corresponde (ver `debe_evaluar`)."""
+    equity = broker.get_account_equity()
+    estado, motivo_halt = evaluar_kill_switches(state_store, equity, momento, risk)
+    if motivo_halt:
+        logger.log_evento("kill_switch_permanente", motivo_halt)
+
+    try:
+        eventos = macro_client.get_calendar("this_week")
+    except ForexFactoryApiError as exc:
+        logger.log_evento("error_macro", str(exc))
+        eventos = []
+
+    evaluar, motivo = debe_evaluar(momento, loop_state, eventos)
+    if not evaluar:
+        return
+    loop_state.ultima_hora_evaluada = _hora_bucket(momento)
+
+    if estado.halted_permanently:
+        logger.log_evento("evaluacion_omitida", "kill switch de drawdown total permanente ya activo")
+        return
+    if estado.perdida_diaria(equity) >= risk.perdida_maxima_diaria:
+        logger.log_evento("evaluacion_omitida", "pausa por pérdida diaria máxima (spec 4.5)")
+        return
+    if estado.perdida_semanal(equity) >= risk.perdida_maxima_semanal:
+        logger.log_evento("evaluacion_omitida", "pausa por pérdida semanal máxima (spec 4.5)")
+        return
+    if broker.get_open_positions_count(symbol) > 0:
+        logger.log_evento("evaluacion_omitida", "ya hay una posición abierta (máximo 1, spec 4.5)")
+        return
+
+    try:
+        h4_bars = price_client.get_bars(symbol, "H4", count=HISTORIAL_MINIMO)
+        h1_bars = price_client.get_bars(symbol, "H1", count=HISTORIAL_MINIMO)
+    except Mt5ConnectionError as exc:
+        logger.log_evento("error_precio", str(exc))
+        return
+
+    if len(h4_bars) < HISTORIAL_MINIMO or len(h1_bars) < HISTORIAL_MINIMO:
+        logger.log_evento("evaluacion_omitida", "historial insuficiente para EMA200")
+        return
+
+    señal = decision_engine.evaluate(eventos, h4_bars, h1_bars)
+
+    if señal.direccion == SignalDirection.NONE:
+        logger.log_evaluacion(señal, ejecutada=False, detalle=motivo)
+        return
+
+    atr_h1 = señal.tecnico.atr_h1
+    if not atr_h1:
+        logger.log_evaluacion(señal, ejecutada=False, detalle="sin ATR disponible")
+        return
+
+    distancia_sl = atr_h1 * risk.atr_multiplo_sl
+    riesgo_dinero = equity * risk.riesgo_por_operacion
+    tamano_unidades = riesgo_dinero / distancia_sl
+
+    precio_referencia = h1_bars[-1].close
+    if señal.direccion == SignalDirection.LONG:
+        sl = precio_referencia - distancia_sl
+        tp = precio_referencia + distancia_sl * risk.relacion_riesgo_beneficio
+    else:
+        sl = precio_referencia + distancia_sl
+        tp = precio_referencia - distancia_sl * risk.relacion_riesgo_beneficio
+
+    resultado_orden = broker.place_market_order(symbol, señal.direccion, tamano_unidades, sl, tp)
+    logger.log_evaluacion(
+        señal,
+        ejecutada=resultado_orden.enviada,
+        detalle=f"disparador={motivo} | orden={resultado_orden}",
+    )
+
+
+def run_forever(
+    *,
+    symbol: str,
+    broker: Mt5Broker,
+    macro_client: ForexFactoryClient,
+    price_client: Mt5PriceClient,
+    decision_engine: DecisionEngine,
+    risk: RiskConfig,
+    logger: DecisionLogger,
+    state_store: KillSwitchStateStore,
+    intervalo_monitoreo_segundos: int = 45,
+) -> None:  # pragma: no cover - loop infinito, probado vía ejecutar_ciclo()
+    """Loop principal de paper trading. Solo se detiene con Ctrl+C."""
+    loop_state = LoopState()
+    logger.log_evento("inicio", f"paper trading iniciado para {symbol}")
+    while True:
+        try:
+            ejecutar_ciclo(
+                momento=datetime.now(timezone.utc),
+                symbol=symbol,
+                broker=broker,
+                macro_client=macro_client,
+                price_client=price_client,
+                decision_engine=decision_engine,
+                risk=risk,
+                logger=logger,
+                state_store=state_store,
+                loop_state=loop_state,
+            )
+        except Exception as exc:  # noqa: BLE001 - un ciclo fallido no debe tumbar 4-8 semanas de ejecución
+            logger.log_evento("error_ciclo", f"{type(exc).__name__}: {exc}")
+        time.sleep(intervalo_monitoreo_segundos)
