@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Sequence
 
 from ..backtest.risk import RiskConfig
@@ -32,6 +32,7 @@ class LoopState:
     eventos_alto_impacto_vistos: set[tuple[str, str, str]] = field(default_factory=set)
     eventos_cache: list[MacroEvent] = field(default_factory=list)
     ultima_consulta_macro: datetime | None = None
+    posicion_abierta_anterior: bool = False
 
 
 def _hora_bucket(momento: datetime) -> str:
@@ -79,6 +80,27 @@ def _obtener_eventos_macro(
     return loop_state.eventos_cache
 
 
+def _revisar_cierre_de_posicion(
+    momento: datetime, symbol: str, broker: Mt5Broker, logger: DecisionLogger, loop_state: LoopState
+) -> None:
+    """El SL/TP lo gestiona el broker directamente, no nuestro loop — así que
+    detectamos el cierre comparando el conteo de posiciones abiertas entre
+    ciclos, y consultamos el historial de MT5 para el resultado (spec 4.7:
+    registrar cada evento, no solo las decisiones de entrada)."""
+    hay_posicion_ahora = broker.get_open_positions_count(symbol) > 0
+    if loop_state.posicion_abierta_anterior and not hay_posicion_ahora:
+        cierre = broker.get_last_closed_trade(symbol, desde=momento - timedelta(days=7))
+        if cierre is not None:
+            logger.log_evento(
+                "posicion_cerrada",
+                f"ticket={cierre['ticket_posicion']} precio_cierre={cierre['precio_cierre']} "
+                f"profit={cierre['profit']:+.2f} volumen={cierre['volumen']}",
+            )
+        else:
+            logger.log_evento("posicion_cerrada", "la posición ya no está abierta, pero no se encontró el deal de cierre en el historial")
+    loop_state.posicion_abierta_anterior = hay_posicion_ahora
+
+
 def debe_evaluar(momento: datetime, loop_state: LoopState, eventos: Sequence[MacroEvent]) -> tuple[bool, str]:
     """
     Dos disparadores posibles de evaluación (spec 4.8), independientes del
@@ -123,6 +145,8 @@ def ejecutar_ciclo(
     estado, motivo_halt = evaluar_kill_switches(state_store, equity, momento, risk)
     if motivo_halt:
         logger.log_evento("kill_switch_permanente", motivo_halt)
+
+    _revisar_cierre_de_posicion(momento, symbol, broker, logger, loop_state)
 
     eventos = _obtener_eventos_macro(momento, loop_state, macro_client, logger, intervalo_macro_segundos)
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from ..config import Settings
 from ..models import SignalDirection
@@ -87,6 +88,24 @@ class Mt5Broker:
         if not posiciones:
             return 0
         return len([p for p in posiciones if p.magic == self.MAGIC])
+
+    def get_last_closed_trade(self, symbol: str, desde: datetime) -> dict | None:
+        """Último cierre (deal DEAL_ENTRY_OUT) de nuestras propias operaciones
+        (mismo `MAGIC`) desde `desde`. None si no hay ninguno en ese rango."""
+        deals = mt5.history_deals_get(desde, datetime.now(timezone.utc), group=f"*{symbol}*")
+        if not deals:
+            return None
+        cierres = [d for d in deals if d.magic == self.MAGIC and d.entry == mt5.DEAL_ENTRY_OUT]
+        if not cierres:
+            return None
+        ultimo = max(cierres, key=lambda d: d.time)
+        return {
+            "ticket_posicion": ultimo.position_id,
+            "precio_cierre": ultimo.price,
+            "profit": ultimo.profit,
+            "volumen": ultimo.volume,
+            "momento": datetime.fromtimestamp(ultimo.time, tz=timezone.utc),
+        }
 
     # SYMBOL_FILLING_FOK/IOC (bits del campo symbol_info().filling_mode) son
     # constantes fijas del protocolo MT5, pero el paquete MetaTrader5 de Python

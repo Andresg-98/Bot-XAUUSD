@@ -78,9 +78,10 @@ def test_same_high_impact_event_does_not_retrigger() -> None:
 
 
 class FakeBroker:
-    def __init__(self, equity: float = 10_000.0, posiciones_abiertas: int = 0) -> None:
+    def __init__(self, equity: float = 10_000.0, posiciones_abiertas: int = 0, ultimo_cierre: dict | None = None) -> None:
         self.equity = equity
         self.posiciones_abiertas = posiciones_abiertas
+        self.ultimo_cierre = ultimo_cierre
         self.ordenes_enviadas: list = []
 
     def get_account_equity(self) -> float:
@@ -88,6 +89,9 @@ class FakeBroker:
 
     def get_open_positions_count(self, symbol: str) -> int:
         return self.posiciones_abiertas
+
+    def get_last_closed_trade(self, symbol, desde):
+        return self.ultimo_cierre
 
     def place_market_order(self, symbol, direccion, sl, tp, *, tamano_unidades=None, lotes=None):
         self.ordenes_enviadas.append((symbol, direccion, sl, tp, tamano_unidades, lotes))
@@ -319,3 +323,45 @@ def test_failed_macro_fetch_still_respects_the_throttle_window(tmp_path: Path) -
     assert macro_client.llamadas == 1
     registros = read_log(tmp_path / "decisiones.jsonl")
     assert sum(1 for r in registros if r["tipo"] == "error_macro") == 1
+
+
+# --- detección de cierre de posición (SL/TP los gestiona el broker, no el loop) -----------
+
+
+def test_position_closure_is_logged_with_the_deal_details(tmp_path: Path) -> None:
+    cierre = {"ticket_posicion": 123, "precio_cierre": 1990.0, "profit": -25.5, "volumen": 0.15}
+    broker = FakeBroker(posiciones_abiertas=0, ultimo_cierre=cierre)
+    loop_state = LoopState(posicion_abierta_anterior=True)  # ciclo anterior: sí había posición
+    kwargs = make_ciclo_kwargs(tmp_path, broker=broker, loop_state=loop_state)
+
+    ejecutar_ciclo(**kwargs)
+
+    registros = read_log(tmp_path / "decisiones.jsonl")
+    cierres_logueados = [r for r in registros if r["tipo"] == "posicion_cerrada"]
+    assert len(cierres_logueados) == 1
+    assert "123" in cierres_logueados[0]["detalle"]
+    assert "-25.50" in cierres_logueados[0]["detalle"]
+    assert loop_state.posicion_abierta_anterior is False
+
+
+def test_no_closure_logged_when_position_stays_open(tmp_path: Path) -> None:
+    broker = FakeBroker(posiciones_abiertas=1)
+    loop_state = LoopState(posicion_abierta_anterior=True)
+    kwargs = make_ciclo_kwargs(tmp_path, broker=broker, loop_state=loop_state)
+
+    ejecutar_ciclo(**kwargs)
+
+    registros = read_log(tmp_path / "decisiones.jsonl")
+    assert not any(r["tipo"] == "posicion_cerrada" for r in registros)
+    assert loop_state.posicion_abierta_anterior is True
+
+
+def test_no_closure_logged_when_there_was_no_previous_position(tmp_path: Path) -> None:
+    broker = FakeBroker(posiciones_abiertas=0)
+    loop_state = LoopState(posicion_abierta_anterior=False)
+    kwargs = make_ciclo_kwargs(tmp_path, broker=broker, loop_state=loop_state)
+
+    ejecutar_ciclo(**kwargs)
+
+    registros = read_log(tmp_path / "decisiones.jsonl")
+    assert not any(r["tipo"] == "posicion_cerrada" for r in registros)

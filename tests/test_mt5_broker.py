@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,8 @@ class FakeMt5:
     ORDER_FILLING_IOC = 1
     ORDER_FILLING_FOK = 2
     ORDER_FILLING_RETURN = 3
+    DEAL_ENTRY_IN = 0
+    DEAL_ENTRY_OUT = 1
     TRADE_RETCODE_DONE = 10009
 
     def __init__(self) -> None:
@@ -31,6 +34,7 @@ class FakeMt5:
         self.tick = SimpleNamespace(ask=2001.0, bid=2000.0)
         self.account = SimpleNamespace(equity=100_000.0)
         self.positiciones: list = []
+        self.deals_historicos: list = []
         self.orden_a_devolver = SimpleNamespace(retcode=self.TRADE_RETCODE_DONE, order=555, price=2001.0)
         self.ultima_request: dict | None = None
 
@@ -61,6 +65,9 @@ class FakeMt5:
     def order_send(self, request: dict):
         self.ultima_request = request
         return self.orden_a_devolver
+
+    def history_deals_get(self, date_from, date_to, group: str = "*"):
+        return list(self.deals_historicos)
 
 
 def make_settings(**overrides: object) -> Settings:
@@ -205,3 +212,40 @@ def test_missing_mt5_package_raises_on_init(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(mt5_broker, "mt5", None)
     with pytest.raises(Mt5ExecutionError):
         Mt5Broker(make_settings())
+
+
+def test_get_last_closed_trade_returns_none_without_closing_deals(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeMt5()
+    broker = connected_broker(monkeypatch, fake, dry_run=True)
+
+    assert broker.get_last_closed_trade("XAUUSD!", datetime(2026, 1, 1, tzinfo=timezone.utc)) is None
+
+
+def test_get_last_closed_trade_ignores_opening_deals_and_other_magic_numbers(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeMt5()
+    fake.deals_historicos = [
+        SimpleNamespace(magic=Mt5Broker.MAGIC, entry=FakeMt5.DEAL_ENTRY_IN, position_id=1, price=0, profit=0, volume=0.01, time=100),
+        SimpleNamespace(magic=999999, entry=FakeMt5.DEAL_ENTRY_OUT, position_id=2, price=0, profit=0, volume=0.01, time=100),
+    ]
+    broker = connected_broker(monkeypatch, fake, dry_run=True)
+
+    assert broker.get_last_closed_trade("XAUUSD!", datetime(2026, 1, 1, tzinfo=timezone.utc)) is None
+
+
+def test_get_last_closed_trade_returns_the_most_recent_closing_deal(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeMt5()
+    fake.deals_historicos = [
+        SimpleNamespace(
+            magic=Mt5Broker.MAGIC, entry=FakeMt5.DEAL_ENTRY_OUT, position_id=111, price=1990.0, profit=-30.0, volume=0.15, time=100
+        ),
+        SimpleNamespace(
+            magic=Mt5Broker.MAGIC, entry=FakeMt5.DEAL_ENTRY_OUT, position_id=222, price=2010.0, profit=50.0, volume=0.15, time=200
+        ),
+    ]
+    broker = connected_broker(monkeypatch, fake, dry_run=True)
+
+    cierre = broker.get_last_closed_trade("XAUUSD!", datetime(2026, 1, 1, tzinfo=timezone.utc))
+
+    assert cierre["ticket_posicion"] == 222  # el más reciente (time=200), no el primero de la lista
+    assert cierre["profit"] == 50.0
+    assert cierre["precio_cierre"] == 2010.0
