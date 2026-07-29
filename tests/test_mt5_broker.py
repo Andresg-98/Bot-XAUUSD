@@ -13,6 +13,7 @@ from bot_xauusd.models import SignalDirection
 
 class FakeMt5:
     TRADE_ACTION_DEAL = 1
+    TRADE_ACTION_SLTP = 6
     ORDER_TYPE_BUY = 0
     ORDER_TYPE_SELL = 1
     ORDER_TIME_GTC = 0
@@ -249,3 +250,60 @@ def test_get_last_closed_trade_returns_the_most_recent_closing_deal(monkeypatch:
     assert cierre["ticket_posicion"] == 222  # el más reciente (time=200), no el primero de la lista
     assert cierre["profit"] == 50.0
     assert cierre["precio_cierre"] == 2010.0
+
+
+def test_get_open_position_returns_none_without_open_positions(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeMt5()
+    broker = connected_broker(monkeypatch, fake, dry_run=True)
+
+    assert broker.get_open_position("XAUUSD!") is None
+
+
+def test_get_open_position_returns_details_of_our_own_position(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeMt5()
+    fake.positiciones = [
+        SimpleNamespace(
+            symbol="XAUUSD!", magic=Mt5Broker.MAGIC, ticket=99, price_open=2000.0, sl=1990.0, tp=2020.0,
+            price_current=2005.0, volume=0.1, type=FakeMt5.ORDER_TYPE_SELL,
+        )
+    ]
+    broker = connected_broker(monkeypatch, fake, dry_run=True)
+
+    posicion = broker.get_open_position("XAUUSD!")
+
+    assert posicion["ticket"] == 99
+    assert posicion["direccion"] == SignalDirection.SHORT
+    assert posicion["sl"] == 1990.0
+
+
+def test_update_stop_loss_in_dry_run_never_calls_order_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeMt5()
+    broker = connected_broker(monkeypatch, fake, dry_run=True)
+
+    exito = broker.update_stop_loss("XAUUSD!", ticket=99, nuevo_sl=2000.0, tp_actual=2020.0)
+
+    assert exito is True
+    assert fake.ultima_request is None
+
+
+def test_update_stop_loss_live_sends_sltp_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeMt5()
+    broker = connected_broker(monkeypatch, fake, dry_run=False)
+
+    exito = broker.update_stop_loss("XAUUSD!", ticket=99, nuevo_sl=2000.0, tp_actual=2020.0)
+
+    assert exito is True
+    assert fake.ultima_request["action"] == FakeMt5.TRADE_ACTION_SLTP
+    assert fake.ultima_request["position"] == 99
+    assert fake.ultima_request["sl"] == 2000.0
+    assert fake.ultima_request["tp"] == 2020.0
+
+
+def test_update_stop_loss_reports_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeMt5()
+    fake.orden_a_devolver = SimpleNamespace(retcode=10004, order=None, price=None, comment="requote")
+    broker = connected_broker(monkeypatch, fake, dry_run=False)
+
+    exito = broker.update_stop_loss("XAUUSD!", ticket=99, nuevo_sl=2000.0, tp_actual=2020.0)
+
+    assert exito is False

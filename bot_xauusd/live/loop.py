@@ -11,6 +11,7 @@ from ..ingestion.macro_forexfactory import ForexFactoryApiError, ForexFactoryCli
 from ..ingestion.price_mt5 import Mt5ConnectionError, Mt5PriceClient
 from ..models import ImpactLevel, MacroEvent, SignalDirection
 from ..signals.decision_engine import DecisionEngine
+from ..signals.indicators import atr
 from .decision_log import DecisionLogger
 from .state import KillSwitchStateStore, evaluar_kill_switches
 
@@ -33,6 +34,7 @@ class LoopState:
     eventos_cache: list[MacroEvent] = field(default_factory=list)
     ultima_consulta_macro: datetime | None = None
     posicion_abierta_anterior: bool = False
+    trailing_distancia_riesgo: float | None = None
 
 
 def _hora_bucket(momento: datetime) -> str:
@@ -98,7 +100,77 @@ def _revisar_cierre_de_posicion(
             )
         else:
             logger.log_evento("posicion_cerrada", "la posición ya no está abierta, pero no se encontró el deal de cierre en el historial")
+    if not hay_posicion_ahora:
+        loop_state.trailing_distancia_riesgo = None
     loop_state.posicion_abierta_anterior = hay_posicion_ahora
+
+
+def _actualizar_trailing_stop(
+    symbol: str,
+    broker: Mt5Broker,
+    price_client: Mt5PriceClient,
+    risk: RiskConfig,
+    logger: DecisionLogger,
+    loop_state: LoopState,
+) -> None:
+    """Breakeven + ATR trailing (a pedido explícito del usuario, no es parte
+    de la spec original): una vez que la operación ganó `trailing_activar_en_r`
+    veces su riesgo inicial, el SL se mueve a breakeven y luego sigue al
+    precio a `trailing_atr_multiplo` × ATR(H1) de distancia. Nunca se mueve en
+    contra (nunca aumenta el riesgo)."""
+    if not risk.trailing_habilitado:
+        return
+
+    posicion = broker.get_open_position(symbol)
+    if posicion is None:
+        return
+
+    if loop_state.trailing_distancia_riesgo is None:
+        # Primera vez que vemos esta posición en este proceso (recién abierta,
+        # o el bot se reinició con una ya abierta): usamos el SL actual como
+        # referencia del riesgo inicial. Si el bot se reinició DESPUÉS de que
+        # el trailing ya hubiera movido el SL, esta referencia queda más
+        # conservadora que la original — no hay persistencia en disco para
+        # esto (a diferencia de los kill switches), limitación aceptada.
+        distancia = abs(posicion["entrada"] - posicion["sl"])
+        if distancia <= 0:
+            return
+        loop_state.trailing_distancia_riesgo = distancia
+
+    distancia_riesgo = loop_state.trailing_distancia_riesgo
+    entrada = posicion["entrada"]
+    sl_actual = posicion["sl"]
+    precio_actual = posicion["precio_actual"]
+
+    try:
+        h1_bars = price_client.get_bars(symbol, "H1", count=15)
+    except Mt5ConnectionError:
+        return
+    if len(h1_bars) < 15:
+        return
+    atr_h1 = atr(h1_bars, period=14)
+
+    if posicion["direccion"] == SignalDirection.LONG:
+        ganancia = precio_actual - entrada
+        if ganancia < distancia_riesgo * risk.trailing_activar_en_r:
+            return
+        nuevo_sl = max(sl_actual, entrada, precio_actual - atr_h1 * risk.trailing_atr_multiplo)
+        mejora = nuevo_sl > sl_actual
+    else:
+        ganancia = entrada - precio_actual
+        if ganancia < distancia_riesgo * risk.trailing_activar_en_r:
+            return
+        nuevo_sl = min(sl_actual, entrada, precio_actual + atr_h1 * risk.trailing_atr_multiplo)
+        mejora = nuevo_sl < sl_actual
+
+    if mejora and abs(nuevo_sl - sl_actual) > 1e-6:
+        exito = broker.update_stop_loss(symbol, posicion["ticket"], nuevo_sl, posicion["tp"])
+        if exito:
+            logger.log_evento(
+                "trailing_stop", f"ticket={posicion['ticket']} SL {sl_actual:.2f} -> {nuevo_sl:.2f}"
+            )
+        else:
+            logger.log_evento("trailing_stop_fallo", f"ticket={posicion['ticket']} no se pudo mover el SL a {nuevo_sl:.2f}")
 
 
 def debe_evaluar(momento: datetime, loop_state: LoopState, eventos: Sequence[MacroEvent]) -> tuple[bool, str]:
@@ -147,6 +219,7 @@ def ejecutar_ciclo(
         logger.log_evento("kill_switch_permanente", motivo_halt)
 
     _revisar_cierre_de_posicion(momento, symbol, broker, logger, loop_state)
+    _actualizar_trailing_stop(symbol, broker, price_client, risk, logger, loop_state)
 
     eventos = _obtener_eventos_macro(momento, loop_state, macro_client, logger, intervalo_macro_segundos)
 

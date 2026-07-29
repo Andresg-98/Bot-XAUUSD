@@ -5,7 +5,7 @@ from pathlib import Path
 
 from bot_xauusd.backtest.risk import RiskConfig
 from bot_xauusd.live.decision_log import DecisionLogger
-from bot_xauusd.live.loop import LoopState, _obtener_eventos_macro, debe_evaluar, ejecutar_ciclo
+from bot_xauusd.live.loop import LoopState, _actualizar_trailing_stop, _obtener_eventos_macro, debe_evaluar, ejecutar_ciclo
 from bot_xauusd.live.state import KillSwitchStateStore
 from bot_xauusd.models import ImpactLevel, MacroEvent, PriceBar, SignalDirection
 from bot_xauusd.signals.decision_engine import Signal
@@ -78,11 +78,19 @@ def test_same_high_impact_event_does_not_retrigger() -> None:
 
 
 class FakeBroker:
-    def __init__(self, equity: float = 10_000.0, posiciones_abiertas: int = 0, ultimo_cierre: dict | None = None) -> None:
+    def __init__(
+        self,
+        equity: float = 10_000.0,
+        posiciones_abiertas: int = 0,
+        ultimo_cierre: dict | None = None,
+        posicion_abierta: dict | None = None,
+    ) -> None:
         self.equity = equity
         self.posiciones_abiertas = posiciones_abiertas
         self.ultimo_cierre = ultimo_cierre
+        self.posicion_abierta = posicion_abierta
         self.ordenes_enviadas: list = []
+        self.sl_actualizados: list = []
 
     def get_account_equity(self) -> float:
         return self.equity
@@ -92,6 +100,13 @@ class FakeBroker:
 
     def get_last_closed_trade(self, symbol, desde):
         return self.ultimo_cierre
+
+    def get_open_position(self, symbol):
+        return self.posicion_abierta
+
+    def update_stop_loss(self, symbol, ticket, nuevo_sl, tp_actual) -> bool:
+        self.sl_actualizados.append((ticket, nuevo_sl, tp_actual))
+        return True
 
     def place_market_order(self, symbol, direccion, sl, tp, *, tamano_unidades=None, lotes=None):
         self.ordenes_enviadas.append((symbol, direccion, sl, tp, tamano_unidades, lotes))
@@ -365,3 +380,76 @@ def test_no_closure_logged_when_there_was_no_previous_position(tmp_path: Path) -
 
     registros = read_log(tmp_path / "decisiones.jsonl")
     assert not any(r["tipo"] == "posicion_cerrada" for r in registros)
+
+
+# --- trailing stop (breakeven + ATR) -------------------------------------------------
+
+TRAILING_RISK = RiskConfig(trailing_habilitado=True, trailing_activar_en_r=1.0, trailing_atr_multiplo=1.5)
+
+
+def make_logger(tmp_path: Path) -> DecisionLogger:
+    return DecisionLogger(tmp_path / "decisiones.jsonl")
+
+
+def test_trailing_disabled_does_nothing(tmp_path: Path) -> None:
+    broker = FakeBroker(posicion_abierta={"ticket": 1, "entrada": 2000, "sl": 1990, "tp": 2050, "precio_actual": 2050, "direccion": SignalDirection.LONG})
+    _actualizar_trailing_stop("XAUUSD!", broker, FakePriceClient(), RiskConfig(trailing_habilitado=False), make_logger(tmp_path), LoopState())
+
+    assert broker.sl_actualizados == []
+
+
+def test_no_open_position_does_nothing(tmp_path: Path) -> None:
+    broker = FakeBroker(posicion_abierta=None)
+    _actualizar_trailing_stop("XAUUSD!", broker, FakePriceClient(), TRAILING_RISK, make_logger(tmp_path), LoopState())
+
+    assert broker.sl_actualizados == []
+
+
+def test_long_below_activation_threshold_does_not_move_sl(tmp_path: Path) -> None:
+    # riesgo inicial = 2000-1990 = 10; ganancia = 2005-2000 = 5 < 10 -> no se activa
+    broker = FakeBroker(posicion_abierta={"ticket": 1, "entrada": 2000, "sl": 1990, "tp": 2050, "precio_actual": 2005, "direccion": SignalDirection.LONG})
+    _actualizar_trailing_stop("XAUUSD!", broker, FakePriceClient(), TRAILING_RISK, make_logger(tmp_path), LoopState())
+
+    assert broker.sl_actualizados == []
+
+
+def test_long_past_activation_moves_sl_to_atr_trail(tmp_path: Path) -> None:
+    # riesgo inicial=10; ganancia=15>=10 -> activado. ATR=2.0 (FakePriceClient) x1.5=3.0
+    # candidato ATR = 2015-3=2012; candidato breakeven=2000; max(1990,2000,2012)=2012
+    broker = FakeBroker(posicion_abierta={"ticket": 7, "entrada": 2000, "sl": 1990, "tp": 2050, "precio_actual": 2015, "direccion": SignalDirection.LONG})
+    _actualizar_trailing_stop("XAUUSD!", broker, FakePriceClient(), TRAILING_RISK, make_logger(tmp_path), LoopState())
+
+    assert broker.sl_actualizados == [(7, 2012.0, 2050)]
+
+
+def test_short_past_activation_moves_sl_down_to_atr_trail(tmp_path: Path) -> None:
+    # riesgo inicial=10; ganancia=2000-1985=15>=10 -> activado. candidato ATR=1985+3=1988
+    # candidato breakeven=2000; min(2010,2000,1988)=1988
+    broker = FakeBroker(posicion_abierta={"ticket": 9, "entrada": 2000, "sl": 2010, "tp": 1950, "precio_actual": 1985, "direccion": SignalDirection.SHORT})
+    _actualizar_trailing_stop("XAUUSD!", broker, FakePriceClient(), TRAILING_RISK, make_logger(tmp_path), LoopState())
+
+    assert broker.sl_actualizados == [(9, 1988.0, 1950)]
+
+
+def test_trailing_never_moves_sl_backwards(tmp_path: Path) -> None:
+    # el SL actual (2012) ya está más protegido que lo que el trailing calcularía
+    # de cero (2000 breakeven, o 2012 con ATR) -- no debe empeorarlo.
+    broker = FakeBroker(posicion_abierta={"ticket": 3, "entrada": 2000, "sl": 2012, "tp": 2050, "precio_actual": 2015, "direccion": SignalDirection.LONG})
+    _actualizar_trailing_stop("XAUUSD!", broker, FakePriceClient(), TRAILING_RISK, make_logger(tmp_path), LoopState())
+
+    assert broker.sl_actualizados == []
+
+
+def test_original_risk_distance_is_cached_not_recomputed_from_a_moved_sl(tmp_path: Path) -> None:
+    loop_state = LoopState()
+    broker = FakeBroker(posicion_abierta={"ticket": 5, "entrada": 2000, "sl": 1990, "tp": 2050, "precio_actual": 2005, "direccion": SignalDirection.LONG})
+    _actualizar_trailing_stop("XAUUSD!", broker, FakePriceClient(), TRAILING_RISK, make_logger(tmp_path), loop_state)
+    assert loop_state.trailing_distancia_riesgo == 10.0
+
+    # el broker ya movió el SL (como si un ciclo anterior lo hubiera hecho) —
+    # la distancia de riesgo cacheada debe seguir siendo la original (10), no 5
+    broker.posicion_abierta["sl"] = 2000.0
+    broker.posicion_abierta["precio_actual"] = 2011.0  # ganancia=11 >= 10 (cacheada) -> se activa
+    _actualizar_trailing_stop("XAUUSD!", broker, FakePriceClient(), TRAILING_RISK, make_logger(tmp_path), loop_state)
+
+    assert loop_state.trailing_distancia_riesgo == 10.0

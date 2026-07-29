@@ -47,6 +47,11 @@ def main() -> None:
 
     logger = DecisionLogger(REPO_ROOT / "logs" / "decisiones.jsonl")
     state_store = KillSwitchStateStore(REPO_ROOT / "data" / "kill_switch_state.json")
+    risk = RiskConfig(trailing_habilitado=True)
+    print(
+        f"Trailing stop: breakeven a {risk.trailing_activar_en_r}R, "
+        f"luego ATR(H1)×{risk.trailing_atr_multiplo} — revisado cada tick de monitoreo"
+    )
 
     try:
         run_forever(
@@ -55,7 +60,7 @@ def main() -> None:
             macro_client=ForexFactoryClient(),
             price_client=price_client,
             decision_engine=DecisionEngine(config=DecisionConfig(redistribuir_peso_si_macro_vacio=True)),
-            risk=RiskConfig(),
+            risk=risk,
             logger=logger,
             state_store=state_store,
             lote_fijo=settings.mt5_lote_fijo,

@@ -29,3 +29,11 @@ class RiskConfig:
     drawdown_maximo_total: float = 0.08  # 8% -> kill switch permanente
     relacion_riesgo_beneficio: float = 3.0  # TP = distancia_sl * este factor (mínimo 1:2 por spec; grid search: 3.0)
     atr_multiplo_sl: float = 2.5  # distancia del stop-loss = ATR(H1) * este múltiplo (grid search: 2.5)
+
+    # Trailing stop (breakeven + ATR). Solo lo aplica el loop en vivo
+    # (bot_xauusd/live/loop.py) — el BacktestEngine todavía NO lo simula, así
+    # que los resultados de la Fase 3 no reflejan este comportamiento. Off por
+    # defecto para no cambiar nada existente; run_paper_trading.py lo activa.
+    trailing_habilitado: bool = False
+    trailing_activar_en_r: float = 1.0  # mueve el SL a breakeven al alcanzar esta ganancia (en múltiplos del riesgo inicial)
+    trailing_atr_multiplo: float = 1.5  # más allá del breakeven, distancia del SL = ATR(H1) * este múltiplo

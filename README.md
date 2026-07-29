@@ -241,6 +241,18 @@ reglas activas (aunque su score neto sea 0 porque se cancelan entre sí), se
 respeta el peso configurado normalmente — el macro real nunca se ignora
 cuando sí está aportando algo.
 
+**Trailing stop (breakeven + ATR, a pedido del usuario — no es parte de la
+spec original):** activado en `run_paper_trading.py` (`RiskConfig.trailing_habilitado`),
+revisado en cada tick de monitoreo (~45s). Una vez que la operación ganó
+`trailing_activar_en_r` (1.0 por defecto) veces su riesgo inicial, el SL se
+mueve a breakeven; más allá de eso, sigue al precio a
+`trailing_atr_multiplo` × ATR(H1) de distancia — nunca se mueve en contra
+(nunca aumenta el riesgo). El SL/TP de una posición ya abierta lo modifica
+`Mt5Broker.update_stop_loss` vía `TRADE_ACTION_SLTP`, separado de la
+apertura de órdenes. **Limitación conocida:** el `BacktestEngine` de la Fase
+3 todavía NO simula trailing, así que sus métricas no reflejan este
+comportamiento — solo aplica al bot en vivo.
+
 **Lotaje manual (`MT5_LOTE_FIJO`, opcional):** por defecto el tamaño de cada
 entrada se calcula automáticamente por riesgo % + distancia de SL en ATR
 (spec 4.5). Si defines `MT5_LOTE_FIJO` en `.env`, el bot usa ese lote fijo

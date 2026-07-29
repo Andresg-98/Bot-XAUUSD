@@ -89,6 +89,38 @@ class Mt5Broker:
             return 0
         return len([p for p in posiciones if p.magic == self.MAGIC])
 
+    def get_open_position(self, symbol: str) -> dict | None:
+        """Detalle de nuestra posición abierta (si hay una) — para trailing stop."""
+        posiciones = mt5.positions_get(symbol=symbol)
+        propias = [p for p in (posiciones or []) if p.magic == self.MAGIC]
+        if not propias:
+            return None
+        p = propias[0]
+        return {
+            "ticket": p.ticket,
+            "entrada": p.price_open,
+            "sl": p.sl,
+            "tp": p.tp,
+            "precio_actual": p.price_current,
+            "volumen": p.volume,
+            "direccion": SignalDirection.LONG if p.type == mt5.ORDER_TYPE_BUY else SignalDirection.SHORT,
+        }
+
+    def update_stop_loss(self, symbol: str, ticket: int, nuevo_sl: float, tp_actual: float) -> bool:
+        """Mueve el SL de una posición abierta (spec 4.6: capa de ejecución
+        separada del motor de decisión). En modo dry_run no toca MT5."""
+        if self.dry_run:
+            return True
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": symbol,
+            "position": ticket,
+            "sl": nuevo_sl,
+            "tp": tp_actual,
+        }
+        resultado = mt5.order_send(request)
+        return resultado is not None and resultado.retcode == mt5.TRADE_RETCODE_DONE
+
     def get_last_closed_trade(self, symbol: str, desde: datetime) -> dict | None:
         """Último cierre (deal DEAL_ENTRY_OUT) de nuestras propias operaciones
         (mismo `MAGIC`) desde `desde`. None si no hay ninguno en ese rango."""
