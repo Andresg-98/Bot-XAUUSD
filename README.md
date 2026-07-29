@@ -214,10 +214,21 @@ asumir uno fijo (`_resolver_filling`). También rechaza (no fuerza) cualquier
 operación cuyo tamaño por riesgo redondee por debajo del lote mínimo del
 broker (spec 4.5).
 
-**Ciclo de monitoreo (spec 4.8):** cada 45s revisa precio/calendario/kill
-switches, sin generar señales. Una nueva evaluación solo se dispara al cierre
-de una vela H1, o inmediatamente si aparece un evento macro de impacto ALTO
-recién publicado — nunca en cada tick, como prohíbe explícitamente la spec.
+**Ciclo de monitoreo (spec 4.8):** cada 45s revisa precio/kill switches, sin
+generar señales. Una nueva evaluación solo se dispara al cierre de una vela
+H1, o si aparece un evento macro de impacto ALTO recién publicado — nunca en
+cada tick, como prohíbe explícitamente la spec. **El calendario de
+ForexFactory se cachea con refresco cada 180s** (`intervalo_macro_segundos`),
+separado del intervalo de monitoreo — corriendo el bot en vivo descubrimos
+que pedirlo cada 45s hace que el feed gratuito devuelva `429 Rate Limited`.
+
+**Lotaje manual (`MT5_LOTE_FIJO`, opcional):** por defecto el tamaño de cada
+entrada se calcula automáticamente por riesgo % + distancia de SL en ATR
+(spec 4.5). Si defines `MT5_LOTE_FIJO` en `.env`, el bot usa ese lote fijo
+para todas las entradas en su lugar — el SL sigue siendo por ATR, así que con
+lote fijo el riesgo en $ de cada operación deja de ser constante (varía con
+la volatilidad). El sizing automático sigue siendo el default recomendado
+por ser el que preserva la garantía de riesgo constante de la spec.
 
 **Kill switches con estado persistente (`live/state.py`):** el equity base
 diario/semanal y el drawdown máximo se guardan en `data/kill_switch_state.json`

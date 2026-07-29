@@ -106,9 +106,15 @@ def ejecutar_ciclo(
     state_store: KillSwitchStateStore,
     loop_state: LoopState,
     intervalo_macro_segundos: int = INTERVALO_MACRO_SEGUNDOS_DEFECTO,
+    lote_fijo: float | None = None,
 ) -> None:
     """Un ciclo de monitoreo (spec 4.8): siempre revisa kill switches; solo
-    evalúa una nueva señal si corresponde (ver `debe_evaluar`)."""
+    evalúa una nueva señal si corresponde (ver `debe_evaluar`).
+
+    `lote_fijo`: si se define, reemplaza el sizing automático por riesgo % +
+    ATR (spec 4.5) con este lote fijo para todas las entradas. El SL sigue
+    calculándose por ATR, así que el riesgo en $ deja de ser constante entre
+    operaciones — es una decisión explícita del usuario (MT5_LOTE_FIJO)."""
     equity = broker.get_account_equity()
     estado, motivo_halt = evaluar_kill_switches(state_store, equity, momento, risk)
     if motivo_halt:
@@ -157,8 +163,6 @@ def ejecutar_ciclo(
         return
 
     distancia_sl = atr_h1 * risk.atr_multiplo_sl
-    riesgo_dinero = equity * risk.riesgo_por_operacion
-    tamano_unidades = riesgo_dinero / distancia_sl
 
     precio_referencia = h1_bars[-1].close
     if señal.direccion == SignalDirection.LONG:
@@ -168,7 +172,14 @@ def ejecutar_ciclo(
         sl = precio_referencia + distancia_sl
         tp = precio_referencia - distancia_sl * risk.relacion_riesgo_beneficio
 
-    resultado_orden = broker.place_market_order(symbol, señal.direccion, tamano_unidades, sl, tp)
+    if lote_fijo is not None:
+        resultado_orden = broker.place_market_order(symbol, señal.direccion, sl=sl, tp=tp, lotes=lote_fijo)
+    else:
+        riesgo_dinero = equity * risk.riesgo_por_operacion
+        tamano_unidades = riesgo_dinero / distancia_sl
+        resultado_orden = broker.place_market_order(
+            symbol, señal.direccion, sl=sl, tp=tp, tamano_unidades=tamano_unidades
+        )
     logger.log_evaluacion(
         señal,
         ejecutada=resultado_orden.enviada,
@@ -188,6 +199,7 @@ def run_forever(
     state_store: KillSwitchStateStore,
     intervalo_monitoreo_segundos: int = 45,
     intervalo_macro_segundos: int = INTERVALO_MACRO_SEGUNDOS_DEFECTO,
+    lote_fijo: float | None = None,
 ) -> None:  # pragma: no cover - loop infinito, probado vía ejecutar_ciclo()
     """Loop principal de paper trading. Solo se detiene con Ctrl+C."""
     loop_state = LoopState()
@@ -206,6 +218,7 @@ def run_forever(
                 state_store=state_store,
                 loop_state=loop_state,
                 intervalo_macro_segundos=intervalo_macro_segundos,
+                lote_fijo=lote_fijo,
             )
         except Exception as exc:  # noqa: BLE001 - un ciclo fallido no debe tumbar 4-8 semanas de ejecución
             logger.log_evento("error_ciclo", f"{type(exc).__name__}: {exc}")

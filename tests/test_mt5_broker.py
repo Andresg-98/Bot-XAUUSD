@@ -72,6 +72,7 @@ def make_settings(**overrides: object) -> Settings:
         mt5_server=None,
         mt5_terminal_path=None,
         mt5_symbol="XAUUSD!",
+        mt5_lote_fijo=None,
     )
     base.update(overrides)
     return Settings(**base)
@@ -123,6 +124,40 @@ def test_uses_fok_when_broker_does_not_support_ioc(monkeypatch: pytest.MonkeyPat
     assert fake.ultima_request["type_filling"] == FakeMt5.ORDER_FILLING_FOK
 
 
+def test_fixed_lot_bypasses_risk_based_sizing(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeMt5()
+    broker = connected_broker(monkeypatch, fake, dry_run=True)
+
+    resultado = broker.place_market_order("XAUUSD!", SignalDirection.LONG, sl=1990.0, tp=2020.0, lotes=0.05)
+
+    assert resultado.volumen == pytest.approx(0.05)
+
+
+def test_fixed_lot_below_broker_minimum_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeMt5()
+    fake.symbol_info_obj.volume_min = 0.1
+    broker = connected_broker(monkeypatch, fake, dry_run=True)
+
+    resultado = broker.place_market_order("XAUUSD!", SignalDirection.LONG, sl=1990.0, tp=2020.0, lotes=0.05)
+
+    assert resultado.enviada is False
+    assert "mínimo" in resultado.motivo_rechazo
+
+
+def test_specifying_both_tamano_unidades_and_lotes_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeMt5()
+    broker = connected_broker(monkeypatch, fake, dry_run=True)
+    with pytest.raises(ValueError):
+        broker.place_market_order("XAUUSD!", SignalDirection.LONG, sl=1990.0, tp=2020.0, tamano_unidades=10.0, lotes=0.05)
+
+
+def test_specifying_neither_tamano_unidades_nor_lotes_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeMt5()
+    broker = connected_broker(monkeypatch, fake, dry_run=True)
+    with pytest.raises(ValueError):
+        broker.place_market_order("XAUUSD!", SignalDirection.LONG, sl=1990.0, tp=2020.0)
+
+
 def test_volume_below_broker_minimum_is_rejected_not_forced(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeMt5()
     fake.symbol_info_obj.volume_min = 0.5  # el broker exige mínimo 0.5 lotes
@@ -163,7 +198,7 @@ def test_operations_require_connect_first(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(mt5_broker, "mt5", FakeMt5())
     broker = Mt5Broker(make_settings(), dry_run=True)
     with pytest.raises(Mt5ExecutionError):
-        broker.place_market_order("XAUUSD!", SignalDirection.LONG, 10.0, 1990.0, 2020.0)
+        broker.place_market_order("XAUUSD!", SignalDirection.LONG, sl=1990.0, tp=2020.0, tamano_unidades=10.0)
 
 
 def test_missing_mt5_package_raises_on_init(monkeypatch: pytest.MonkeyPatch) -> None:

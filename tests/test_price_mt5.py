@@ -40,6 +40,7 @@ def make_settings(**overrides: object) -> Settings:
         mt5_server="srv",
         mt5_terminal_path=None,
         mt5_symbol="XAUUSD",
+        mt5_lote_fijo=None,
     )
     base.update(overrides)
     return Settings(**base)

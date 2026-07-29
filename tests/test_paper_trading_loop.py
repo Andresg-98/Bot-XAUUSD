@@ -89,8 +89,8 @@ class FakeBroker:
     def get_open_positions_count(self, symbol: str) -> int:
         return self.posiciones_abiertas
 
-    def place_market_order(self, symbol, direccion, tamano_unidades, sl, tp):
-        self.ordenes_enviadas.append((symbol, direccion, tamano_unidades, sl, tp))
+    def place_market_order(self, symbol, direccion, sl, tp, *, tamano_unidades=None, lotes=None):
+        self.ordenes_enviadas.append((symbol, direccion, sl, tp, tamano_unidades, lotes))
         return _FakeOrderResult()
 
 
@@ -267,3 +267,29 @@ def test_ejecutar_ciclo_reuses_cached_macro_events_across_calls(tmp_path: Path) 
     ejecutar_ciclo(**kwargs2)
 
     assert macro_client.llamadas == 1
+
+
+# --- lote fijo (MT5_LOTE_FIJO) -----------------------------------------------------------
+
+
+def test_signal_uses_fixed_lot_when_configured(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    kwargs = make_ciclo_kwargs(tmp_path, broker=broker, lote_fijo=0.05)
+
+    ejecutar_ciclo(**kwargs)
+
+    assert len(broker.ordenes_enviadas) == 1
+    _symbol, _direccion, _sl, _tp, tamano_unidades, lotes = broker.ordenes_enviadas[0]
+    assert lotes == 0.05
+    assert tamano_unidades is None
+
+
+def test_signal_uses_risk_based_sizing_when_no_fixed_lot_configured(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    kwargs = make_ciclo_kwargs(tmp_path, broker=broker)  # lote_fijo no incluido -> None por defecto
+
+    ejecutar_ciclo(**kwargs)
+
+    _symbol, _direccion, _sl, _tp, tamano_unidades, lotes = broker.ordenes_enviadas[0]
+    assert lotes is None
+    assert tamano_unidades is not None

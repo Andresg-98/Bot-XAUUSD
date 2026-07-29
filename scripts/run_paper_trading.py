@@ -31,6 +31,10 @@ def main() -> None:
 
     print(f"Modo: {'*** LIVE (envía órdenes reales a MT5) ***' if live else 'SIMULADO (dry-run, no envía nada)'}")
     print(f"Símbolo: {settings.mt5_symbol}")
+    if settings.mt5_lote_fijo is not None:
+        print(f"Lotaje: FIJO {settings.mt5_lote_fijo} (MT5_LOTE_FIJO) — reemplaza el sizing automático por riesgo")
+    else:
+        print("Lotaje: automático por riesgo % + ATR (spec 4.5)")
 
     try:
         broker = Mt5Broker(settings, dry_run=not live)
@@ -54,6 +58,7 @@ def main() -> None:
             risk=RiskConfig(),
             logger=logger,
             state_store=state_store,
+            lote_fijo=settings.mt5_lote_fijo,
         )
     except KeyboardInterrupt:
         print("\nDetenido por el usuario (Ctrl+C).")

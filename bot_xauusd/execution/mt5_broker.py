@@ -105,38 +105,63 @@ class Mt5Broker:
             return mt5.ORDER_FILLING_FOK
         return mt5.ORDER_FILLING_RETURN
 
-    def _resolver_volumen(self, info: object, tamano_unidades: float) -> tuple[float | None, str | None]:
-        contrato = info.trade_contract_size or 1.0
-        lotes_deseados = tamano_unidades / contrato
+    @staticmethod
+    def _redondear_a_paso(lotes_deseados: float, info: object) -> tuple[float | None, str | None]:
         paso = info.volume_step or 0.01
-        lotes = math.floor(lotes_deseados / paso) * paso
-        lotes = round(lotes, 2)
-
+        lotes = round(math.floor(lotes_deseados / paso) * paso, 2)
         if lotes < info.volume_min:
-            # Spec 4.5: rechazar la operación en vez de forzar un tamaño que viole
-            # el % de riesgo configurado — nunca redondear hacia arriba para "que entre".
             return None, (
-                f"El tamaño de posición por riesgo ({lotes_deseados:.4f} lotes) redondea por debajo del "
-                f"mínimo del broker ({info.volume_min}) — se rechaza en vez de operar con más riesgo del "
-                "configurado (spec 4.5)."
+                f"El tamaño de posición ({lotes_deseados:.4f} lotes) redondea por debajo del mínimo del "
+                f"broker ({info.volume_min})."
             )
         if info.volume_max and lotes > info.volume_max:
             lotes = info.volume_max
+        return lotes, None
+
+    def _resolver_volumen_por_riesgo(self, info: object, tamano_unidades: float) -> tuple[float | None, str | None]:
+        contrato = info.trade_contract_size or 1.0
+        lotes_deseados = tamano_unidades / contrato
+        lotes, motivo = self._redondear_a_paso(lotes_deseados, info)
+        if lotes is None:
+            # Spec 4.5: rechazar la operación en vez de forzar un tamaño que viole
+            # el % de riesgo configurado — nunca redondear hacia arriba para "que entre".
+            return None, motivo + " Se rechaza en vez de operar con más riesgo del configurado (spec 4.5)."
+        return lotes, None
+
+    def _resolver_volumen_fijo(self, info: object, lotes_solicitados: float) -> tuple[float | None, str | None]:
+        lotes, motivo = self._redondear_a_paso(lotes_solicitados, info)
+        if lotes is None:
+            return None, motivo + " Ajusta MT5_LOTE_FIJO en tu .env."
         return lotes, None
 
     def place_market_order(
         self,
         symbol: str,
         direccion: SignalDirection,
-        tamano_unidades: float,
         sl: float,
         tp: float,
+        *,
+        tamano_unidades: float | None = None,
+        lotes: float | None = None,
         comentario: str = "bot_xauusd",
     ) -> OrderResult:
+        """
+        El tamaño de la posición se especifica de una de dos formas,
+        mutuamente excluyentes:
+        - `tamano_unidades`: tamaño calculado por riesgo % + distancia de SL
+          (comportamiento por defecto — spec 4.5).
+        - `lotes`: tamaño de lote FIJO, decidido manualmente por el usuario
+          (`MT5_LOTE_FIJO` en `.env`), que reemplaza el cálculo por riesgo.
+          Nota: el SL sigue siendo por ATR, así que con lote fijo el riesgo
+          en $ de cada operación varía con la volatilidad — deja de ser
+          constante como con el sizing automático.
+        """
         if not self._connected:
             raise Mt5ExecutionError("Debes llamar a connect() (o usar 'with') antes de operar.")
         if direccion not in (SignalDirection.LONG, SignalDirection.SHORT):
             raise ValueError("direccion debe ser LONG o SHORT.")
+        if (tamano_unidades is None) == (lotes is None):
+            raise ValueError("Debes especificar exactamente uno: tamano_unidades o lotes.")
 
         if not mt5.symbol_select(symbol, True):
             return OrderResult(False, None, None, None, None, None, f"No se pudo seleccionar '{symbol}'.", self.dry_run)
@@ -145,7 +170,11 @@ class Mt5Broker:
         if info is None:
             return OrderResult(False, None, None, None, None, None, f"Símbolo '{symbol}' no encontrado en el broker.", self.dry_run)
 
-        lotes, motivo_rechazo = self._resolver_volumen(info, tamano_unidades)
+        if lotes is not None:
+            lotes_resueltos, motivo_rechazo = self._resolver_volumen_fijo(info, lotes)
+        else:
+            lotes_resueltos, motivo_rechazo = self._resolver_volumen_por_riesgo(info, tamano_unidades)
+        lotes = lotes_resueltos
         if lotes is None:
             return OrderResult(False, None, None, None, None, None, motivo_rechazo, self.dry_run)
 
