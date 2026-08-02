@@ -12,6 +12,7 @@ load_dotenv()
 class Settings:
     fred_api_key: str | None
     twelvedata_api_key: str | None
+    alphavantage_api_key: str | None
     mt5_login: int | None
     mt5_password: str | None
     mt5_server: str | None
@@ -26,6 +27,7 @@ def load_settings() -> Settings:
     return Settings(
         fred_api_key=os.getenv("FRED_API_KEY") or None,
         twelvedata_api_key=os.getenv("TWELVEDATA_API_KEY") or None,
+        alphavantage_api_key=os.getenv("ALPHAVANTAGE_API_KEY") or None,
         mt5_login=int(login) if login else None,
         mt5_password=os.getenv("MT5_PASSWORD") or None,
         mt5_server=os.getenv("MT5_SERVER") or None,

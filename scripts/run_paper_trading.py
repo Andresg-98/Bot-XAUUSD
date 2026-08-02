@@ -16,6 +16,8 @@ from bot_xauusd.backtest.risk import RiskConfig  # noqa: E402
 from bot_xauusd.config import load_settings  # noqa: E402
 from bot_xauusd.execution.mt5_broker import Mt5Broker, Mt5ExecutionError  # noqa: E402
 from bot_xauusd.ingestion.macro_forexfactory import ForexFactoryClient  # noqa: E402
+from bot_xauusd.ingestion.macro_fred import FredMacroClient  # noqa: E402
+from bot_xauusd.ingestion.news_sentiment import AlphaVantageNewsSentimentClient  # noqa: E402
 from bot_xauusd.ingestion.price_mt5 import Mt5ConnectionError, Mt5PriceClient  # noqa: E402
 from bot_xauusd.live.decision_log import DecisionLogger  # noqa: E402
 from bot_xauusd.live.loop import run_forever  # noqa: E402
@@ -53,6 +55,21 @@ def main() -> None:
         f"luego ATR(H1)×{risk.trailing_atr_multiplo} — revisado cada tick de monitoreo"
     )
 
+    fred_client = FredMacroClient(settings.fred_api_key) if settings.fred_api_key else None
+    print(
+        "Fuente macro FRED (DXY/VIX): activa"
+        if fred_client
+        else "Fuente macro FRED (DXY/VIX): INACTIVA (falta FRED_API_KEY en .env)"
+    )
+    sentiment_client = (
+        AlphaVantageNewsSentimentClient(settings.alphavantage_api_key) if settings.alphavantage_api_key else None
+    )
+    print(
+        "Refuerzo de sentimiento de noticias: activo"
+        if sentiment_client
+        else "Refuerzo de sentimiento de noticias: INACTIVO (falta ALPHAVANTAGE_API_KEY en .env)"
+    )
+
     try:
         run_forever(
             symbol=settings.mt5_symbol,
@@ -64,6 +81,8 @@ def main() -> None:
             logger=logger,
             state_store=state_store,
             lote_fijo=settings.mt5_lote_fijo,
+            fred_client=fred_client,
+            sentiment_client=sentiment_client,
         )
     except KeyboardInterrupt:
         print("\nDetenido por el usuario (Ctrl+C).")

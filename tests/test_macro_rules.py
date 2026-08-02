@@ -66,6 +66,34 @@ def test_rising_dxy_is_bearish_for_gold() -> None:
     assert resultado.score < 0
 
 
+def test_rising_vix_is_bullish_for_gold() -> None:
+    engine = MacroRuleEngine(reglas=[r for r in DEFAULT_RULES if r.nombre == "riesgo_vix"])
+    eventos = [make_event("Índice de volatilidad VIX (aversión al riesgo)", valor_real=25.0, valor_previo=18.0)]
+    resultado = engine.evaluate(eventos)
+    assert resultado.score > 0
+
+
+def test_falling_vix_is_bearish_for_gold() -> None:
+    engine = MacroRuleEngine(reglas=[r for r in DEFAULT_RULES if r.nombre == "riesgo_vix"])
+    eventos = [make_event("Índice de volatilidad VIX (aversión al riesgo)", valor_real=15.0, valor_previo=20.0)]
+    resultado = engine.evaluate(eventos)
+    assert resultado.score < 0
+
+
+def test_negative_news_sentiment_is_bullish_for_gold() -> None:
+    engine = MacroRuleEngine(reglas=[r for r in DEFAULT_RULES if r.nombre == "sentimiento_noticias"])
+    eventos = [make_event("Sentimiento de noticias (mercados financieros)", valor_real=-0.6)]
+    resultado = engine.evaluate(eventos)
+    assert resultado.score > 0
+
+
+def test_positive_news_sentiment_is_bearish_for_gold() -> None:
+    engine = MacroRuleEngine(reglas=[r for r in DEFAULT_RULES if r.nombre == "sentimiento_noticias"])
+    eventos = [make_event("Sentimiento de noticias (mercados financieros)", valor_real=0.6)]
+    resultado = engine.evaluate(eventos)
+    assert resultado.score < 0
+
+
 def test_non_usd_events_are_ignored_by_rules() -> None:
     engine = MacroRuleEngine(reglas=[r for r in DEFAULT_RULES if r.nombre == "inflacion_cpi_pce"])
     eventos = [make_event("CPI y/y", pais="EUR", valor_real=5.0, valor_esperado=1.0)]

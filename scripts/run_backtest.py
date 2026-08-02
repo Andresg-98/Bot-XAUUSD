@@ -16,12 +16,14 @@ from bot_xauusd.config import load_settings  # noqa: E402
 from bot_xauusd.ingestion.price_twelvedata import TwelveDataApiError, TwelveDataPriceClient  # noqa: E402
 from bot_xauusd.signals.decision_engine import DecisionConfig, DecisionEngine  # noqa: E402
 
-AÑOS_DE_HISTORIAL = 3
+AÑOS_DE_HISTORIAL_DEFECTO = 3
 PROFIT_FACTOR_OBJETIVO = 1.4
 DRAWDOWN_MAXIMO_OBJETIVO = 0.16  # spec 4.5: el doble del 8% real permitido
 
 
 def main() -> None:
+    años = float(sys.argv[1]) if len(sys.argv) > 1 else AÑOS_DE_HISTORIAL_DEFECTO
+
     settings = load_settings()
     if not settings.twelvedata_api_key:
         print("Falta TWELVEDATA_API_KEY. Copia .env.example a .env y completa tu API key gratuita de TwelveData.")
@@ -29,7 +31,7 @@ def main() -> None:
 
     cliente = TwelveDataPriceClient(api_key=settings.twelvedata_api_key)
     fin = datetime.now(timezone.utc)
-    inicio = fin - timedelta(days=365 * AÑOS_DE_HISTORIAL)
+    inicio = fin - timedelta(days=365 * años)
 
     print(f"Descargando histórico H4/H1 de XAU/USD desde {inicio.date()} hasta {fin.date()} (TwelveData)...")
     try:

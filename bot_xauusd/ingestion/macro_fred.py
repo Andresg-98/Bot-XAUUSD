@@ -20,7 +20,8 @@ class WatchedSeries:
 
 
 # Series vigiladas porque el motor de reglas macro (spec_bot_xauusd.md, 4.2) las usa
-# como disparadores de sesgo: CPI/PCE, NFP, tasa de la Fed y el índice del dólar.
+# como disparadores de sesgo: CPI/PCE, NFP, tasa de la Fed, el índice del dólar y
+# el VIX (proxy cuantitativo de aversión al riesgo — ver macro_rules.py).
 WATCHED_SERIES: tuple[WatchedSeries, ...] = (
     WatchedSeries("CPIAUCSL", "CPI (Índice de Precios al Consumidor)", "US", ImpactLevel.ALTO),
     WatchedSeries("PCEPILFE", "Core PCE (gasto de consumo subyacente)", "US", ImpactLevel.ALTO),
@@ -28,6 +29,7 @@ WATCHED_SERIES: tuple[WatchedSeries, ...] = (
     WatchedSeries("UNRATE", "Tasa de desempleo", "US", ImpactLevel.MEDIO),
     WatchedSeries("DFF", "Tasa de fondos federales (Fed Funds Rate)", "US", ImpactLevel.ALTO),
     WatchedSeries("DTWEXBGS", "Índice del dólar (DXY, ponderado por comercio)", "US", ImpactLevel.MEDIO),
+    WatchedSeries("VIXCLS", "Índice de volatilidad VIX (aversión al riesgo)", "US", ImpactLevel.MEDIO),
 )
 
 

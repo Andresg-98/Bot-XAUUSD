@@ -69,15 +69,38 @@ términos vigentes de ForexFactory y de Fair Economy (spec, sección 2).
 Da el esquema ideal de la sección 4.1 de la spec: evento, hora, país (moneda),
 impacto, valor esperado (forecast), valor real (una vez publicado) y valor previo.
 
-## Fuente de datos macro: FRED (respaldo)
+## Fuente de datos macro: FRED (respaldo + VIX/DXY en vivo)
 
 Gratis, oficial y sin límite práctico, pero sin calendario de eventos futuros ni
 valores de consenso — solo series históricas ya publicadas (CPI, Core PCE, NFP,
-tasa de desempleo, Fed Funds Rate, índice del dólar). Útil como verificación
-cruzada de datos oficiales de la Fed, no como fuente principal del calendario.
-`valor_esperado` queda siempre en `None` en este cliente.
+tasa de desempleo, Fed Funds Rate, índice del dólar, **VIX**). `valor_esperado`
+queda siempre en `None` en este cliente. El bot en vivo (`run_paper_trading.py`)
+lo consulta cada 6 horas (cambia con poca frecuencia) para alimentar las reglas
+`dxy_confirmacion` y `riesgo_vix` — **sin `FRED_API_KEY` configurada, estas dos
+reglas simplemente quedan inactivas**, el resto del bot sigue funcionando igual.
 
 Consigue tu API key gratuita en https://fred.stlouisfed.org/docs/api/api_key.html
+
+## Refuerzo de sentimiento de noticias: Alpha Vantage
+
+Implementa la regla de "aversión al riesgo" de la spec (4.2: geopolítica/caídas
+bursátiles → sesgo alcista en XAUUSD) junto con el VIX: **VIX como señal
+principal** (cuantitativa, confiable, peso 0.10), **noticias como refuerzo**
+(peso 0.05). `AlphaVantageNewsSentimentClient` promedia el `overall_sentiment_score`
+de las noticias recientes de mercados financieros/macro (`NEWS_SENTIMENT`,
+topics `financial_markets,economy_macro`) en un único `MacroEvent` sintético;
+sentimiento negativo (temor/ventas masivas) → sesgo alcista en oro.
+
+**Tier gratuito muy limitado** (~25 peticiones/día) — el bot lo consulta cada 2
+horas (máx. 12/día) para no agotar la cuota. Sin `ALPHAVANTAGE_API_KEY`
+configurada, esta regla queda inactiva, sin afectar el resto.
+
+Consigue tu API key gratuita en https://www.alphavantage.co/support/#api-key
+
+**Nota honesta:** ninguna de las dos ("noticias de mercado en general") mide
+sentimiento específico sobre XAUUSD ni geopolítica pura — son proxies. Es lo
+que la spec permite hacer con fuentes gratuitas y confiables; no se intentó
+construir un clasificador de texto propio para esto.
 
 ## Precio en vivo: MetaTrader5
 
@@ -112,15 +135,18 @@ ponderado de las reglas que sí encontraron un evento relevante:
 
 | Regla | Peso por defecto | Lógica |
 |---|---|---|
-| `inflacion_cpi_pce` | 0.35 | CPI/PCE real > esperado → USD fuerte → bajista |
-| `empleo_nfp` | 0.30 | NFP real > esperado → USD fuerte → bajista |
-| `tasa_fed` | 0.25 | Tasa Fed real > esperado (hawkish) → bajista |
+| `inflacion_cpi_pce` | 0.30 | CPI/PCE real > esperado → USD fuerte → bajista |
+| `empleo_nfp` | 0.25 | NFP real > esperado → USD fuerte → bajista |
+| `tasa_fed` | 0.20 | Tasa Fed real > esperado (hawkish) → bajista |
 | `dxy_confirmacion` | 0.10 | Índice del dólar (FRED) subiendo → bajista |
+| `riesgo_vix` | 0.10 | VIX (FRED) subiendo → aversión al riesgo → alcista (refugio) |
+| `sentimiento_noticias` | 0.05 | Sentimiento de noticias de mercado (Alpha Vantage) negativo → alcista |
 
-**Limitación conocida:** la regla de "aversión al riesgo" de la spec
-(geopolítica/caídas bursátiles → alcista) **no está implementada** — requiere
-una fuente de sentimiento de noticias o un proxy (p. ej. VIX) que aún no existe
-en el módulo de ingesta. Implementarla sin esos datos sería adivinar.
+`riesgo_vix` + `sentimiento_noticias` implementan juntas la regla de "aversión
+al riesgo" de la spec (geopolítica/caídas bursátiles → alcista) — VIX como
+señal principal cuantitativa, noticias como refuerzo de menor peso. Ver
+sección "Refuerzo de sentimiento de noticias" arriba para el detalle y las
+limitaciones honestas de este enfoque.
 
 ## Motor de tendencia técnica (4.3) y filtro H4/H1 (4.8)
 

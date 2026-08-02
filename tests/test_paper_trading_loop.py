@@ -5,7 +5,15 @@ from pathlib import Path
 
 from bot_xauusd.backtest.risk import RiskConfig
 from bot_xauusd.live.decision_log import DecisionLogger
-from bot_xauusd.live.loop import LoopState, _actualizar_trailing_stop, _obtener_eventos_macro, debe_evaluar, ejecutar_ciclo
+from bot_xauusd.live.loop import (
+    LoopState,
+    _actualizar_trailing_stop,
+    _obtener_eventos_fred,
+    _obtener_eventos_macro,
+    _obtener_eventos_sentimiento,
+    debe_evaluar,
+    ejecutar_ciclo,
+)
 from bot_xauusd.live.state import KillSwitchStateStore
 from bot_xauusd.models import ImpactLevel, MacroEvent, PriceBar, SignalDirection
 from bot_xauusd.signals.decision_engine import Signal
@@ -453,3 +461,94 @@ def test_original_risk_distance_is_cached_not_recomputed_from_a_moved_sl(tmp_pat
     _actualizar_trailing_stop("XAUUSD!", broker, FakePriceClient(), TRAILING_RISK, make_logger(tmp_path), loop_state)
 
     assert loop_state.trailing_distancia_riesgo == 10.0
+
+
+# --- FRED (VIX/DXY) y sentimiento de noticias (refuerzo de aversión al riesgo) -----------
+
+
+class FakeFredClient:
+    def __init__(self, eventos: list | None = None) -> None:
+        self._eventos = eventos or []
+        self.llamadas = 0
+
+    def get_latest_events(self):
+        self.llamadas += 1
+        return self._eventos
+
+
+class FakeSentimentClient:
+    def __init__(self, eventos: list | None = None) -> None:
+        self._eventos = eventos or []
+        self.llamadas = 0
+
+    def get_latest_events(self):
+        self.llamadas += 1
+        return self._eventos
+
+
+def test_fred_client_none_returns_empty_list_without_calling_anything(tmp_path: Path) -> None:
+    eventos = _obtener_eventos_fred(
+        datetime(2026, 1, 1, tzinfo=timezone.utc), LoopState(), None, make_logger(tmp_path), intervalo_segundos=180
+    )
+    assert eventos == []
+
+
+def test_fred_events_are_cached_within_the_throttle_window(tmp_path: Path) -> None:
+    fred_client = FakeFredClient(eventos=[make_event("VIX", ImpactLevel.MEDIO, valor_real=20.0, fecha=datetime(2026, 1, 1, tzinfo=timezone.utc))])
+    logger = make_logger(tmp_path)
+    loop_state = LoopState()
+    momento = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+
+    _obtener_eventos_fred(momento, loop_state, fred_client, logger, intervalo_segundos=180)
+    _obtener_eventos_fred(momento + timedelta(seconds=45), loop_state, fred_client, logger, intervalo_segundos=180)
+
+    assert fred_client.llamadas == 1
+
+
+def test_sentiment_client_none_returns_empty_list_without_calling_anything(tmp_path: Path) -> None:
+    eventos = _obtener_eventos_sentimiento(
+        datetime(2026, 1, 1, tzinfo=timezone.utc), LoopState(), None, make_logger(tmp_path), intervalo_segundos=7200
+    )
+    assert eventos == []
+
+
+def test_sentiment_events_are_cached_within_the_throttle_window(tmp_path: Path) -> None:
+    sentiment_client = FakeSentimentClient(eventos=[])
+    logger = make_logger(tmp_path)
+    loop_state = LoopState()
+    momento = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+
+    _obtener_eventos_sentimiento(momento, loop_state, sentiment_client, logger, intervalo_segundos=7200)
+    _obtener_eventos_sentimiento(momento + timedelta(minutes=10), loop_state, sentiment_client, logger, intervalo_segundos=7200)
+
+    assert sentiment_client.llamadas == 1
+
+
+def test_ejecutar_ciclo_merges_events_from_all_three_sources(tmp_path: Path) -> None:
+    momento = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+    ff_event = make_event("ForexFactory event", ImpactLevel.ALTO, valor_real=1.0, fecha=momento)
+    fred_event = make_event("VIX", ImpactLevel.MEDIO, valor_real=20.0, fecha=momento)
+    sentiment_event = make_event("Sentimiento de noticias", ImpactLevel.MEDIO, valor_real=-0.3, fecha=momento)
+
+    eventos_recibidos = {}
+
+    class CapturingDecisionEngine:
+        def evaluate(self, eventos, h4_bars, h1_bars):
+            eventos_recibidos["eventos"] = list(eventos)
+            tecnico = TechnicalScoreResult(
+                score=0.0, tendencia_h4=TrendDirection.NEUTRAL, tendencia_h1=TrendDirection.NEUTRAL,
+                estructura_h1=TrendDirection.NEUTRAL, rsi_h1=50.0, atr_h1=2.0, razones=[],
+            )
+            return Signal(direccion=SignalDirection.NONE, score_final=0.0, macro=MacroScoreResult(score=0.0, resultados=[]), tecnico=tecnico, razones=[])
+
+    kwargs = make_ciclo_kwargs(
+        tmp_path,
+        momento=momento,
+        macro_client=FakeMacroClient(eventos=[ff_event]),
+        fred_client=FakeFredClient(eventos=[fred_event]),
+        sentiment_client=FakeSentimentClient(eventos=[sentiment_event]),
+        decision_engine=CapturingDecisionEngine(),
+    )
+    ejecutar_ciclo(**kwargs)
+
+    assert eventos_recibidos["eventos"] == [ff_event, fred_event, sentiment_event]

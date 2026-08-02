@@ -77,6 +77,7 @@ def make_settings(**overrides: object) -> Settings:
     base = dict(
         fred_api_key=None,
         twelvedata_api_key=None,
+        alphavantage_api_key=None,
         mt5_login=None,
         mt5_password=None,
         mt5_server=None,

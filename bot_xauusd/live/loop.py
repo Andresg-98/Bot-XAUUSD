@@ -8,6 +8,8 @@ from typing import Sequence
 from ..backtest.risk import RiskConfig
 from ..execution.mt5_broker import Mt5Broker
 from ..ingestion.macro_forexfactory import ForexFactoryApiError, ForexFactoryClient
+from ..ingestion.macro_fred import FredApiError, FredMacroClient
+from ..ingestion.news_sentiment import AlphaVantageNewsSentimentClient, NewsSentimentApiError
 from ..ingestion.price_mt5 import Mt5ConnectionError, Mt5PriceClient
 from ..models import ImpactLevel, MacroEvent, SignalDirection
 from ..signals.decision_engine import DecisionEngine
@@ -17,6 +19,13 @@ from .state import KillSwitchStateStore, evaluar_kill_switches
 
 HISTORIAL_MINIMO = 250
 INTERVALO_MACRO_SEGUNDOS_DEFECTO = 180
+# FRED cambia con mucha menos frecuencia que ForexFactory (series diarias, no
+# un calendario que se actualiza a cada rato) y su tier gratuito es generoso
+# — igual se cachea por horas para no consultar sin necesidad.
+INTERVALO_FRED_SEGUNDOS_DEFECTO = 6 * 3600
+# Alpha Vantage NEWS_SENTIMENT: tier gratuito históricamente de 25
+# peticiones/día. 2 horas -> máx. 12/día, con margen de sobra.
+INTERVALO_SENTIMIENTO_SEGUNDOS_DEFECTO = 2 * 3600
 
 
 @dataclass
@@ -33,6 +42,10 @@ class LoopState:
     eventos_alto_impacto_vistos: set[tuple[str, str, str]] = field(default_factory=set)
     eventos_cache: list[MacroEvent] = field(default_factory=list)
     ultima_consulta_macro: datetime | None = None
+    eventos_fred_cache: list[MacroEvent] = field(default_factory=list)
+    ultima_consulta_fred: datetime | None = None
+    eventos_sentimiento_cache: list[MacroEvent] = field(default_factory=list)
+    ultima_consulta_sentimiento: datetime | None = None
     posicion_abierta_anterior: bool = False
     trailing_distancia_riesgo: float | None = None
 
@@ -80,6 +93,65 @@ def _obtener_eventos_macro(
     except ForexFactoryApiError as exc:
         logger.log_evento("error_macro", str(exc))
     return loop_state.eventos_cache
+
+
+def _obtener_eventos_fred(
+    momento: datetime,
+    loop_state: LoopState,
+    fred_client: FredMacroClient | None,
+    logger: DecisionLogger,
+    intervalo_segundos: int,
+) -> list[MacroEvent]:
+    """Mismo patrón de caché que `_obtener_eventos_macro`, para el VIX y la
+    confirmación DXY (reglas `riesgo_vix` y `dxy_confirmacion`, spec 4.2).
+    `fred_client=None` (sin FRED_API_KEY configurada) simplemente omite estas
+    reglas — el resto del bot sigue funcionando igual."""
+    if fred_client is None:
+        return []
+    vencido = (
+        loop_state.ultima_consulta_fred is None
+        or (momento - loop_state.ultima_consulta_fred).total_seconds() >= intervalo_segundos
+    )
+    if not vencido:
+        return loop_state.eventos_fred_cache
+
+    loop_state.ultima_consulta_fred = momento
+    try:
+        loop_state.eventos_fred_cache = fred_client.get_latest_events()
+    except FredApiError as exc:
+        logger.log_evento("error_fred", str(exc))
+    except Exception as exc:  # noqa: BLE001 - errores de red no tipados no deben tumbar el ciclo
+        logger.log_evento("error_fred", f"{type(exc).__name__}: {exc}")
+    return loop_state.eventos_fred_cache
+
+
+def _obtener_eventos_sentimiento(
+    momento: datetime,
+    loop_state: LoopState,
+    sentiment_client: AlphaVantageNewsSentimentClient | None,
+    logger: DecisionLogger,
+    intervalo_segundos: int,
+) -> list[MacroEvent]:
+    """Mismo patrón de caché, para el refuerzo de sentimiento de noticias
+    (regla `sentimiento_noticias`, spec 4.2). `sentiment_client=None` (sin
+    ALPHAVANTAGE_API_KEY configurada) simplemente omite esta regla."""
+    if sentiment_client is None:
+        return []
+    vencido = (
+        loop_state.ultima_consulta_sentimiento is None
+        or (momento - loop_state.ultima_consulta_sentimiento).total_seconds() >= intervalo_segundos
+    )
+    if not vencido:
+        return loop_state.eventos_sentimiento_cache
+
+    loop_state.ultima_consulta_sentimiento = momento
+    try:
+        loop_state.eventos_sentimiento_cache = sentiment_client.get_latest_events()
+    except NewsSentimentApiError as exc:
+        logger.log_evento("error_sentimiento", str(exc))
+    except Exception as exc:  # noqa: BLE001 - errores de red no tipados no deben tumbar el ciclo
+        logger.log_evento("error_sentimiento", f"{type(exc).__name__}: {exc}")
+    return loop_state.eventos_sentimiento_cache
 
 
 def _revisar_cierre_de_posicion(
@@ -205,6 +277,10 @@ def ejecutar_ciclo(
     loop_state: LoopState,
     intervalo_macro_segundos: int = INTERVALO_MACRO_SEGUNDOS_DEFECTO,
     lote_fijo: float | None = None,
+    fred_client: FredMacroClient | None = None,
+    intervalo_fred_segundos: int = INTERVALO_FRED_SEGUNDOS_DEFECTO,
+    sentiment_client: AlphaVantageNewsSentimentClient | None = None,
+    intervalo_sentimiento_segundos: int = INTERVALO_SENTIMIENTO_SEGUNDOS_DEFECTO,
 ) -> None:
     """Un ciclo de monitoreo (spec 4.8): siempre revisa kill switches; solo
     evalúa una nueva señal si corresponde (ver `debe_evaluar`).
@@ -212,7 +288,12 @@ def ejecutar_ciclo(
     `lote_fijo`: si se define, reemplaza el sizing automático por riesgo % +
     ATR (spec 4.5) con este lote fijo para todas las entradas. El SL sigue
     calculándose por ATR, así que el riesgo en $ deja de ser constante entre
-    operaciones — es una decisión explícita del usuario (MT5_LOTE_FIJO)."""
+    operaciones — es una decisión explícita del usuario (MT5_LOTE_FIJO).
+
+    `fred_client`/`sentiment_client` son opcionales: sin ellos, el bot sigue
+    funcionando solo con ForexFactory (comportamiento previo). Con ellos,
+    también contribuyen las reglas `dxy_confirmacion`, `riesgo_vix` y
+    `sentimiento_noticias` (spec 4.2)."""
     equity = broker.get_account_equity()
     estado, motivo_halt = evaluar_kill_switches(state_store, equity, momento, risk)
     if motivo_halt:
@@ -221,7 +302,12 @@ def ejecutar_ciclo(
     _revisar_cierre_de_posicion(momento, symbol, broker, logger, loop_state)
     _actualizar_trailing_stop(symbol, broker, price_client, risk, logger, loop_state)
 
-    eventos = _obtener_eventos_macro(momento, loop_state, macro_client, logger, intervalo_macro_segundos)
+    eventos_ff = _obtener_eventos_macro(momento, loop_state, macro_client, logger, intervalo_macro_segundos)
+    eventos_fred = _obtener_eventos_fred(momento, loop_state, fred_client, logger, intervalo_fred_segundos)
+    eventos_sentimiento = _obtener_eventos_sentimiento(
+        momento, loop_state, sentiment_client, logger, intervalo_sentimiento_segundos
+    )
+    eventos = [*eventos_ff, *eventos_fred, *eventos_sentimiento]
 
     evaluar, motivo = debe_evaluar(momento, loop_state, eventos)
     if not evaluar:
@@ -301,6 +387,10 @@ def run_forever(
     intervalo_monitoreo_segundos: int = 45,
     intervalo_macro_segundos: int = INTERVALO_MACRO_SEGUNDOS_DEFECTO,
     lote_fijo: float | None = None,
+    fred_client: FredMacroClient | None = None,
+    intervalo_fred_segundos: int = INTERVALO_FRED_SEGUNDOS_DEFECTO,
+    sentiment_client: AlphaVantageNewsSentimentClient | None = None,
+    intervalo_sentimiento_segundos: int = INTERVALO_SENTIMIENTO_SEGUNDOS_DEFECTO,
 ) -> None:  # pragma: no cover - loop infinito, probado vía ejecutar_ciclo()
     """Loop principal de paper trading. Solo se detiene con Ctrl+C."""
     loop_state = LoopState()
@@ -320,6 +410,10 @@ def run_forever(
                 loop_state=loop_state,
                 intervalo_macro_segundos=intervalo_macro_segundos,
                 lote_fijo=lote_fijo,
+                fred_client=fred_client,
+                intervalo_fred_segundos=intervalo_fred_segundos,
+                sentiment_client=sentiment_client,
+                intervalo_sentimiento_segundos=intervalo_sentimiento_segundos,
             )
         except Exception as exc:  # noqa: BLE001 - un ciclo fallido no debe tumbar 4-8 semanas de ejecución
             logger.log_evento("error_ciclo", f"{type(exc).__name__}: {exc}")
