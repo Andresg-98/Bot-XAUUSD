@@ -5,12 +5,15 @@ from pathlib import Path
 
 from bot_xauusd.backtest.risk import RiskConfig
 from bot_xauusd.live.decision_log import DecisionLogger
+from bot_xauusd.execution.mt5_broker import Mt5ExecutionError
+from bot_xauusd.ingestion.price_mt5 import Mt5ConnectionError
 from bot_xauusd.live.loop import (
     LoopState,
     _actualizar_trailing_stop,
     _obtener_eventos_fred,
     _obtener_eventos_macro,
     _obtener_eventos_sentimiento,
+    _reconectar_si_hace_falta,
     debe_evaluar,
     ejecutar_ciclo,
 )
@@ -552,3 +555,62 @@ def test_ejecutar_ciclo_merges_events_from_all_three_sources(tmp_path: Path) -> 
     ejecutar_ciclo(**kwargs)
 
     assert eventos_recibidos["eventos"] == [ff_event, fred_event, sentiment_event]
+
+
+# --- reconexión ante pérdida de la conexión IPC con MT5 ------------------------------------
+
+
+class FakeReconnectClient:
+    def __init__(self, falla_al_reconectar: bool = False) -> None:
+        self.conexiones = 0
+        self.falla_al_reconectar = falla_al_reconectar
+
+    def connect(self) -> None:
+        self.conexiones += 1
+        if self.falla_al_reconectar:
+            raise Mt5ExecutionError("sigue caído")
+
+
+def test_reconnects_broker_and_price_client_on_mt5_execution_error(tmp_path: Path) -> None:
+    broker = FakeReconnectClient()
+    price_client = FakeReconnectClient()
+    logger = make_logger(tmp_path)
+
+    _reconectar_si_hace_falta(Mt5ExecutionError("IPC send failed"), broker, price_client, logger)
+
+    assert broker.conexiones == 1
+    assert price_client.conexiones == 1
+    registros = read_log(tmp_path / "decisiones.jsonl")
+    assert any(r["tipo"] == "reconexion_mt5" for r in registros)
+
+
+def test_reconnects_on_mt5_connection_error_too(tmp_path: Path) -> None:
+    broker = FakeReconnectClient()
+    price_client = FakeReconnectClient()
+    logger = make_logger(tmp_path)
+
+    _reconectar_si_hace_falta(Mt5ConnectionError("desconectado"), broker, price_client, logger)
+
+    assert broker.conexiones == 1
+
+
+def test_does_not_reconnect_on_unrelated_errors(tmp_path: Path) -> None:
+    broker = FakeReconnectClient()
+    price_client = FakeReconnectClient()
+    logger = make_logger(tmp_path)
+
+    _reconectar_si_hace_falta(ValueError("otra cosa"), broker, price_client, logger)
+
+    assert broker.conexiones == 0
+    assert price_client.conexiones == 0
+
+
+def test_logs_failure_when_reconnection_itself_fails(tmp_path: Path) -> None:
+    broker = FakeReconnectClient(falla_al_reconectar=True)
+    price_client = FakeReconnectClient()
+    logger = make_logger(tmp_path)
+
+    _reconectar_si_hace_falta(Mt5ExecutionError("IPC send failed"), broker, price_client, logger)
+
+    registros = read_log(tmp_path / "decisiones.jsonl")
+    assert any(r["tipo"] == "reconexion_mt5_fallo" for r in registros)

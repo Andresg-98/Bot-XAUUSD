@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Sequence
 
 from ..backtest.risk import RiskConfig
-from ..execution.mt5_broker import Mt5Broker
+from ..execution.mt5_broker import Mt5Broker, Mt5ExecutionError
 from ..ingestion.macro_forexfactory import ForexFactoryApiError, ForexFactoryClient
 from ..ingestion.macro_fred import FredApiError, FredMacroClient
 from ..ingestion.news_sentiment import AlphaVantageNewsSentimentClient, NewsSentimentApiError
@@ -245,6 +245,25 @@ def _actualizar_trailing_stop(
             logger.log_evento("trailing_stop_fallo", f"ticket={posicion['ticket']} no se pudo mover el SL a {nuevo_sl:.2f}")
 
 
+def _reconectar_si_hace_falta(
+    exc: Exception, broker: Mt5Broker, price_client: Mt5PriceClient, logger: DecisionLogger
+) -> None:
+    """La conexión IPC de MT5 puede romperse (ej. `Mt5ExecutionError: IPC send
+    failed`) y quedarse rota indefinidamente — a diferencia de los errores de
+    red hacia ForexFactory, esto NO se recupera solo reintentando en el
+    siguiente ciclo, porque `broker`/`price_client` siguen usando la misma
+    sesión ya rota. Se descubrió corriendo el bot en vivo (se quedó fallando
+    cada ciclo por más de 30 minutos sin recuperarse)."""
+    if not isinstance(exc, (Mt5ExecutionError, Mt5ConnectionError)):
+        return
+    try:
+        broker.connect()
+        price_client.connect()
+        logger.log_evento("reconexion_mt5", "Reconexión exitosa tras pérdida de conexión con MT5.")
+    except (Mt5ExecutionError, Mt5ConnectionError) as exc2:
+        logger.log_evento("reconexion_mt5_fallo", f"{type(exc2).__name__}: {exc2}")
+
+
 def debe_evaluar(momento: datetime, loop_state: LoopState, eventos: Sequence[MacroEvent]) -> tuple[bool, str]:
     """
     Dos disparadores posibles de evaluación (spec 4.8), independientes del
@@ -417,4 +436,5 @@ def run_forever(
             )
         except Exception as exc:  # noqa: BLE001 - un ciclo fallido no debe tumbar 4-8 semanas de ejecución
             logger.log_evento("error_ciclo", f"{type(exc).__name__}: {exc}")
+            _reconectar_si_hace_falta(exc, broker, price_client, logger)
         time.sleep(intervalo_monitoreo_segundos)
