@@ -89,22 +89,24 @@ class Mt5Broker:
             return 0
         return len([p for p in posiciones if p.magic == self.MAGIC])
 
-    def get_open_position(self, symbol: str) -> dict | None:
-        """Detalle de nuestra posición abierta (si hay una) — para trailing stop."""
+    def get_open_positions(self, symbol: str) -> list[dict]:
+        """Detalle de TODAS nuestras posiciones abiertas (0, 1 o 2) — para
+        trailing stop y detección de cierre, cada una identificada por su
+        `ticket` (spec 4.5: hasta 2 posiciones, la 2a solo por evento macro)."""
         posiciones = mt5.positions_get(symbol=symbol)
         propias = [p for p in (posiciones or []) if p.magic == self.MAGIC]
-        if not propias:
-            return None
-        p = propias[0]
-        return {
-            "ticket": p.ticket,
-            "entrada": p.price_open,
-            "sl": p.sl,
-            "tp": p.tp,
-            "precio_actual": p.price_current,
-            "volumen": p.volume,
-            "direccion": SignalDirection.LONG if p.type == mt5.ORDER_TYPE_BUY else SignalDirection.SHORT,
-        }
+        return [
+            {
+                "ticket": p.ticket,
+                "entrada": p.price_open,
+                "sl": p.sl,
+                "tp": p.tp,
+                "precio_actual": p.price_current,
+                "volumen": p.volume,
+                "direccion": SignalDirection.LONG if p.type == mt5.ORDER_TYPE_BUY else SignalDirection.SHORT,
+            }
+            for p in propias
+        ]
 
     def update_stop_loss(self, symbol: str, ticket: int, nuevo_sl: float, tp_actual: float) -> bool:
         """Mueve el SL de una posición abierta (spec 4.6: capa de ejecución
@@ -121,23 +123,27 @@ class Mt5Broker:
         resultado = mt5.order_send(request)
         return resultado is not None and resultado.retcode == mt5.TRADE_RETCODE_DONE
 
-    def get_last_closed_trade(self, symbol: str, desde: datetime) -> dict | None:
-        """Último cierre (deal DEAL_ENTRY_OUT) de nuestras propias operaciones
-        (mismo `MAGIC`) desde `desde`. None si no hay ninguno en ese rango."""
+    def get_closed_trades_since(self, symbol: str, desde: datetime) -> list[dict]:
+        """Cierres (deals DEAL_ENTRY_OUT) de nuestras propias operaciones
+        (mismo `MAGIC`) desde `desde`, ordenados por momento ascendente. Con
+        hasta 2 posiciones simultáneas, más de una puede cerrarse en la misma
+        ventana — se devuelven todas para poder emparejar cada una con su
+        ticket."""
         deals = mt5.history_deals_get(desde, datetime.now(timezone.utc), group=f"*{symbol}*")
         if not deals:
-            return None
+            return []
         cierres = [d for d in deals if d.magic == self.MAGIC and d.entry == mt5.DEAL_ENTRY_OUT]
-        if not cierres:
-            return None
-        ultimo = max(cierres, key=lambda d: d.time)
-        return {
-            "ticket_posicion": ultimo.position_id,
-            "precio_cierre": ultimo.price,
-            "profit": ultimo.profit,
-            "volumen": ultimo.volume,
-            "momento": datetime.fromtimestamp(ultimo.time, tz=timezone.utc),
-        }
+        cierres.sort(key=lambda d: d.time)
+        return [
+            {
+                "ticket_posicion": d.position_id,
+                "precio_cierre": d.price,
+                "profit": d.profit,
+                "volumen": d.volume,
+                "momento": datetime.fromtimestamp(d.time, tz=timezone.utc),
+            }
+            for d in cierres
+        ]
 
     # SYMBOL_FILLING_FOK/IOC (bits del campo symbol_info().filling_mode) son
     # constantes fijas del protocolo MT5, pero el paquete MetaTrader5 de Python

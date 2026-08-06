@@ -18,6 +18,15 @@ from .decision_log import DecisionLogger
 from .state import KillSwitchStateStore, evaluar_kill_switches
 
 HISTORIAL_MINIMO = 250
+# Máximo 2 posiciones simultáneas (spec 4.5 ampliada a pedido explícito del
+# usuario): la 1a se abre por cualquier disparador válido; la 2a SOLO si el
+# disparador es un evento macro de alto impacto real recién publicado — nunca
+# por otra señal técnica mientras ya hay una posición abierta. Cada una
+# arriesga su propio riesgo_por_operacion (0.5% por defecto) de forma
+# independiente — es decir, el riesgo TOTAL puede duplicarse con las 2
+# abiertas; es una decisión de riesgo explícita del usuario, no el
+# comportamiento recomendado por la spec original (4.5: máximo 1).
+MAX_POSICIONES = 2
 INTERVALO_MACRO_SEGUNDOS_DEFECTO = 180
 # FRED cambia con mucha menos frecuencia que ForexFactory (series diarias, no
 # un calendario que se actualiza a cada rato) y su tier gratuito es generoso
@@ -46,8 +55,8 @@ class LoopState:
     ultima_consulta_fred: datetime | None = None
     eventos_sentimiento_cache: list[MacroEvent] = field(default_factory=list)
     ultima_consulta_sentimiento: datetime | None = None
-    posicion_abierta_anterior: bool = False
-    trailing_distancia_riesgo: float | None = None
+    tickets_abiertos_anterior: set[int] = field(default_factory=set)
+    trailing_distancia_riesgo_por_ticket: dict[int, float] = field(default_factory=dict)
 
 
 def _hora_bucket(momento: datetime) -> str:
@@ -158,46 +167,47 @@ def _revisar_cierre_de_posicion(
     momento: datetime, symbol: str, broker: Mt5Broker, logger: DecisionLogger, loop_state: LoopState
 ) -> None:
     """El SL/TP lo gestiona el broker directamente, no nuestro loop — así que
-    detectamos el cierre comparando el conteo de posiciones abiertas entre
-    ciclos, y consultamos el historial de MT5 para el resultado (spec 4.7:
-    registrar cada evento, no solo las decisiones de entrada)."""
-    hay_posicion_ahora = broker.get_open_positions_count(symbol) > 0
-    if loop_state.posicion_abierta_anterior and not hay_posicion_ahora:
-        cierre = broker.get_last_closed_trade(symbol, desde=momento - timedelta(days=7))
-        if cierre is not None:
-            logger.log_evento(
-                "posicion_cerrada",
-                f"ticket={cierre['ticket_posicion']} precio_cierre={cierre['precio_cierre']} "
-                f"profit={cierre['profit']:+.2f} volumen={cierre['volumen']}",
-            )
-        else:
-            logger.log_evento("posicion_cerrada", "la posición ya no está abierta, pero no se encontró el deal de cierre en el historial")
-    if not hay_posicion_ahora:
-        loop_state.trailing_distancia_riesgo = None
-    loop_state.posicion_abierta_anterior = hay_posicion_ahora
+    detectamos cada cierre comparando el conjunto de tickets abiertos entre
+    ciclos (puede haber hasta 2 a la vez), y consultamos el historial de MT5
+    para emparejar cada ticket cerrado con su resultado (spec 4.7: registrar
+    cada evento, no solo las decisiones de entrada)."""
+    posiciones_actuales = broker.get_open_positions(symbol)
+    tickets_actuales = {p["ticket"] for p in posiciones_actuales}
+    tickets_cerrados = loop_state.tickets_abiertos_anterior - tickets_actuales
+
+    if tickets_cerrados:
+        cierres_por_ticket = {
+            c["ticket_posicion"]: c for c in broker.get_closed_trades_since(symbol, desde=momento - timedelta(days=7))
+        }
+        for ticket in tickets_cerrados:
+            cierre = cierres_por_ticket.get(ticket)
+            if cierre is not None:
+                logger.log_evento(
+                    "posicion_cerrada",
+                    f"ticket={cierre['ticket_posicion']} precio_cierre={cierre['precio_cierre']} "
+                    f"profit={cierre['profit']:+.2f} volumen={cierre['volumen']}",
+                )
+            else:
+                logger.log_evento(
+                    "posicion_cerrada",
+                    f"ticket={ticket} ya no está abierto, pero no se encontró el deal de cierre en el historial",
+                )
+            loop_state.trailing_distancia_riesgo_por_ticket.pop(ticket, None)
+
+    loop_state.tickets_abiertos_anterior = tickets_actuales
 
 
-def _actualizar_trailing_stop(
-    symbol: str,
-    broker: Mt5Broker,
-    price_client: Mt5PriceClient,
+def _aplicar_trailing_a_posicion(
+    posicion: dict,
+    atr_h1: float,
     risk: RiskConfig,
+    broker: Mt5Broker,
+    symbol: str,
     logger: DecisionLogger,
     loop_state: LoopState,
 ) -> None:
-    """Breakeven + ATR trailing (a pedido explícito del usuario, no es parte
-    de la spec original): una vez que la operación ganó `trailing_activar_en_r`
-    veces su riesgo inicial, el SL se mueve a breakeven y luego sigue al
-    precio a `trailing_atr_multiplo` × ATR(H1) de distancia. Nunca se mueve en
-    contra (nunca aumenta el riesgo)."""
-    if not risk.trailing_habilitado:
-        return
-
-    posicion = broker.get_open_position(symbol)
-    if posicion is None:
-        return
-
-    if loop_state.trailing_distancia_riesgo is None:
+    ticket = posicion["ticket"]
+    if ticket not in loop_state.trailing_distancia_riesgo_por_ticket:
         # Primera vez que vemos esta posición en este proceso (recién abierta,
         # o el bot se reinició con una ya abierta): usamos el SL actual como
         # referencia del riesgo inicial. Si el bot se reinició DESPUÉS de que
@@ -207,20 +217,12 @@ def _actualizar_trailing_stop(
         distancia = abs(posicion["entrada"] - posicion["sl"])
         if distancia <= 0:
             return
-        loop_state.trailing_distancia_riesgo = distancia
+        loop_state.trailing_distancia_riesgo_por_ticket[ticket] = distancia
 
-    distancia_riesgo = loop_state.trailing_distancia_riesgo
+    distancia_riesgo = loop_state.trailing_distancia_riesgo_por_ticket[ticket]
     entrada = posicion["entrada"]
     sl_actual = posicion["sl"]
     precio_actual = posicion["precio_actual"]
-
-    try:
-        h1_bars = price_client.get_bars(symbol, "H1", count=15)
-    except Mt5ConnectionError:
-        return
-    if len(h1_bars) < 15:
-        return
-    atr_h1 = atr(h1_bars, period=14)
 
     if posicion["direccion"] == SignalDirection.LONG:
         ganancia = precio_actual - entrada
@@ -236,13 +238,44 @@ def _actualizar_trailing_stop(
         mejora = nuevo_sl < sl_actual
 
     if mejora and abs(nuevo_sl - sl_actual) > 1e-6:
-        exito = broker.update_stop_loss(symbol, posicion["ticket"], nuevo_sl, posicion["tp"])
+        exito = broker.update_stop_loss(symbol, ticket, nuevo_sl, posicion["tp"])
         if exito:
-            logger.log_evento(
-                "trailing_stop", f"ticket={posicion['ticket']} SL {sl_actual:.2f} -> {nuevo_sl:.2f}"
-            )
+            logger.log_evento("trailing_stop", f"ticket={ticket} SL {sl_actual:.2f} -> {nuevo_sl:.2f}")
         else:
-            logger.log_evento("trailing_stop_fallo", f"ticket={posicion['ticket']} no se pudo mover el SL a {nuevo_sl:.2f}")
+            logger.log_evento("trailing_stop_fallo", f"ticket={ticket} no se pudo mover el SL a {nuevo_sl:.2f}")
+
+
+def _actualizar_trailing_stop(
+    symbol: str,
+    broker: Mt5Broker,
+    price_client: Mt5PriceClient,
+    risk: RiskConfig,
+    logger: DecisionLogger,
+    loop_state: LoopState,
+) -> None:
+    """Breakeven + ATR trailing (a pedido explícito del usuario, no es parte
+    de la spec original): una vez que una operación ganó `trailing_activar_en_r`
+    veces su riesgo inicial, su SL se mueve a breakeven y luego sigue al
+    precio a `trailing_atr_multiplo` × ATR(H1) de distancia. Nunca se mueve en
+    contra (nunca aumenta el riesgo). Se aplica a cada posición abierta por
+    separado (puede haber hasta 2, spec 4.5 ampliada)."""
+    if not risk.trailing_habilitado:
+        return
+
+    posiciones = broker.get_open_positions(symbol)
+    if not posiciones:
+        return
+
+    try:
+        h1_bars = price_client.get_bars(symbol, "H1", count=15)
+    except Mt5ConnectionError:
+        return
+    if len(h1_bars) < 15:
+        return
+    atr_h1 = atr(h1_bars, period=14)
+
+    for posicion in posiciones:
+        _aplicar_trailing_a_posicion(posicion, atr_h1, risk, broker, symbol, logger, loop_state)
 
 
 def _reconectar_si_hace_falta(
@@ -262,6 +295,25 @@ def _reconectar_si_hace_falta(
         logger.log_evento("reconexion_mt5", "Reconexión exitosa tras pérdida de conexión con MT5.")
     except (Mt5ExecutionError, Mt5ConnectionError) as exc2:
         logger.log_evento("reconexion_mt5_fallo", f"{type(exc2).__name__}: {exc2}")
+
+
+def _puede_abrir_nueva_posicion(cantidad_abiertas: int, motivo_evaluacion: str) -> tuple[bool, str]:
+    """Hasta `MAX_POSICIONES` (2) simultáneas: la 1a se abre por cualquier
+    disparador válido; la 2a SOLO si el disparador de esta evaluación es un
+    evento macro de alto impacto real (no otra señal técnica cualquiera
+    mientras ya hay una posición abierta) — spec 4.5 ampliada a pedido del
+    usuario."""
+    if cantidad_abiertas >= MAX_POSICIONES:
+        return False, f"ya hay {cantidad_abiertas} posiciones abiertas (máximo {MAX_POSICIONES})"
+    if cantidad_abiertas == 0:
+        return True, ""
+    es_evento_macro = motivo_evaluacion.startswith("evento macro de alto impacto")
+    if es_evento_macro:
+        return True, ""
+    return False, (
+        "ya hay una posición abierta; una 2a solo se abre si el disparador es un evento macro de "
+        "alto impacto real, no otra señal técnica (spec 4.5 ampliada)"
+    )
 
 
 def debe_evaluar(momento: datetime, loop_state: LoopState, eventos: Sequence[MacroEvent]) -> tuple[bool, str]:
@@ -314,9 +366,11 @@ def ejecutar_ciclo(
     también contribuyen las reglas `dxy_confirmacion`, `riesgo_vix` y
     `sentimiento_noticias` (spec 4.2)."""
     equity = broker.get_account_equity()
-    estado, motivo_halt = evaluar_kill_switches(state_store, equity, momento, risk)
-    if motivo_halt:
-        logger.log_evento("kill_switch_permanente", motivo_halt)
+    estado, motivo_halt_permanente, motivo_halt_semanal = evaluar_kill_switches(state_store, equity, momento, risk)
+    if motivo_halt_permanente:
+        logger.log_evento("kill_switch_permanente", motivo_halt_permanente)
+    if motivo_halt_semanal:
+        logger.log_evento("kill_switch_semanal", motivo_halt_semanal)
 
     _revisar_cierre_de_posicion(momento, symbol, broker, logger, loop_state)
     _actualizar_trailing_stop(symbol, broker, price_client, risk, logger, loop_state)
@@ -336,14 +390,19 @@ def ejecutar_ciclo(
     if estado.halted_permanently:
         logger.log_evento("evaluacion_omitida", "kill switch de drawdown total permanente ya activo")
         return
+    if estado.halted_semanalmente:
+        logger.log_evento(
+            "evaluacion_omitida",
+            "pausa semanal activa — requiere aprobación manual para reactivar "
+            "(scripts/reactivar_pausa_semanal.py), no se reinicia sola (spec 4.5)",
+        )
+        return
     if estado.perdida_diaria(equity) >= risk.perdida_maxima_diaria:
         logger.log_evento("evaluacion_omitida", "pausa por pérdida diaria máxima (spec 4.5)")
         return
-    if estado.perdida_semanal(equity) >= risk.perdida_maxima_semanal:
-        logger.log_evento("evaluacion_omitida", "pausa por pérdida semanal máxima (spec 4.5)")
-        return
-    if broker.get_open_positions_count(symbol) > 0:
-        logger.log_evento("evaluacion_omitida", "ya hay una posición abierta (máximo 1, spec 4.5)")
+    puede_abrir, motivo_rechazo = _puede_abrir_nueva_posicion(broker.get_open_positions_count(symbol), motivo)
+    if not puede_abrir:
+        logger.log_evento("evaluacion_omitida", motivo_rechazo)
         return
 
     try:

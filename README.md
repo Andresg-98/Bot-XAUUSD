@@ -279,6 +279,21 @@ apertura de órdenes. **Limitación conocida:** el `BacktestEngine` de la Fase
 3 todavía NO simula trailing, así que sus métricas no reflejan este
 comportamiento — solo aplica al bot en vivo.
 
+**Hasta 2 posiciones simultáneas (spec 4.5 ampliada a pedido explícito del
+usuario, solo en el bot en vivo):** por defecto la spec permite máximo 1
+(evita exposición correlacionada, ya que ambas serían sobre el mismo
+símbolo). Ahora el bot en vivo permite una 2a posición, pero únicamente si el
+disparador de esa evaluación es un evento macro de alto impacto real recién
+publicado (`_puede_abrir_nueva_posicion` en `live/loop.py`) — nunca por otra
+señal técnica mientras ya hay una posición abierta. Cada posición arriesga su
+0.5% de forma independiente, así que el riesgo total de la cuenta puede
+llegar a 1% con las dos abiertas — el usuario confirmó esto explícitamente,
+sabiendo que duplica el riesgo del perfil conservador original. El trailing
+stop y la detección de cierre (`_revisar_cierre_de_posicion`) manejan cada
+posición por separado, identificada por su ticket. El `BacktestEngine` de la
+Fase 3 sigue con el límite de 1 (no se tocó) — este cambio es solo del bot
+en vivo.
+
 **Lotaje manual (`MT5_LOTE_FIJO`, opcional):** por defecto el tamaño de cada
 entrada se calcula automáticamente por riesgo % + distancia de SL en ATR
 (spec 4.5). Si defines `MT5_LOTE_FIJO` en `.env`, el bot usa ese lote fijo
@@ -291,6 +306,16 @@ por ser el que preserva la garantía de riesgo constante de la spec.
 diario/semanal y el drawdown máximo se guardan en `data/kill_switch_state.json`
 para sobrevivir a un reinicio del script durante las 4-8 semanas — si el
 kill switch permanente ya se activó, sigue activo aunque reinicies.
+
+**Pausa semanal con aprobación manual (spec 4.5):** a diferencia de la pausa
+diaria (que sí se reinicia sola "por el resto del día"), la spec exige que la
+pérdida semanal máxima (3%) "requiera revisar la lógica antes de reactivar,
+no reinicio automático". Se descubrió en vivo que la implementación original
+no cumplía esto — se reiniciaba sola con cada semana calendario nueva. Ya
+corregido: `halted_semanalmente` queda activo indefinidamente, sin importar
+cuántas semanas pasen o si el equity se recupera, hasta correr
+`scripts/reactivar_pausa_semanal.py` (pide confirmación explícita y resetea
+la base de equity semanal al momento de la reactivación).
 
 **Logging (spec 4.7):** cada decisión (se ejecute o no), con su razonamiento
 completo, se registra en `logs/decisiones.jsonl` (JSON-lines). Sin Telegram/

@@ -218,14 +218,14 @@ def test_missing_mt5_package_raises_on_init(monkeypatch: pytest.MonkeyPatch) -> 
         Mt5Broker(make_settings())
 
 
-def test_get_last_closed_trade_returns_none_without_closing_deals(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_closed_trades_since_returns_empty_list_without_closing_deals(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeMt5()
     broker = connected_broker(monkeypatch, fake, dry_run=True)
 
-    assert broker.get_last_closed_trade("XAUUSD!", datetime(2026, 1, 1, tzinfo=timezone.utc)) is None
+    assert broker.get_closed_trades_since("XAUUSD!", datetime(2026, 1, 1, tzinfo=timezone.utc)) == []
 
 
-def test_get_last_closed_trade_ignores_opening_deals_and_other_magic_numbers(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_closed_trades_since_ignores_opening_deals_and_other_magic_numbers(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeMt5()
     fake.deals_historicos = [
         SimpleNamespace(magic=Mt5Broker.MAGIC, entry=FakeMt5.DEAL_ENTRY_IN, position_id=1, price=0, profit=0, volume=0.01, time=100),
@@ -233,50 +233,60 @@ def test_get_last_closed_trade_ignores_opening_deals_and_other_magic_numbers(mon
     ]
     broker = connected_broker(monkeypatch, fake, dry_run=True)
 
-    assert broker.get_last_closed_trade("XAUUSD!", datetime(2026, 1, 1, tzinfo=timezone.utc)) is None
+    assert broker.get_closed_trades_since("XAUUSD!", datetime(2026, 1, 1, tzinfo=timezone.utc)) == []
 
 
-def test_get_last_closed_trade_returns_the_most_recent_closing_deal(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_closed_trades_since_returns_all_closing_deals_in_ascending_order(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeMt5()
     fake.deals_historicos = [
         SimpleNamespace(
-            magic=Mt5Broker.MAGIC, entry=FakeMt5.DEAL_ENTRY_OUT, position_id=111, price=1990.0, profit=-30.0, volume=0.15, time=100
+            magic=Mt5Broker.MAGIC, entry=FakeMt5.DEAL_ENTRY_OUT, position_id=111, price=1990.0, profit=-30.0, volume=0.15, time=200
         ),
         SimpleNamespace(
-            magic=Mt5Broker.MAGIC, entry=FakeMt5.DEAL_ENTRY_OUT, position_id=222, price=2010.0, profit=50.0, volume=0.15, time=200
+            magic=Mt5Broker.MAGIC, entry=FakeMt5.DEAL_ENTRY_OUT, position_id=222, price=2010.0, profit=50.0, volume=0.15, time=100
         ),
     ]
     broker = connected_broker(monkeypatch, fake, dry_run=True)
 
-    cierre = broker.get_last_closed_trade("XAUUSD!", datetime(2026, 1, 1, tzinfo=timezone.utc))
+    cierres = broker.get_closed_trades_since("XAUUSD!", datetime(2026, 1, 1, tzinfo=timezone.utc))
 
-    assert cierre["ticket_posicion"] == 222  # el más reciente (time=200), no el primero de la lista
-    assert cierre["profit"] == 50.0
-    assert cierre["precio_cierre"] == 2010.0
+    assert [c["ticket_posicion"] for c in cierres] == [222, 111]  # ordenados por tiempo ascendente
+    assert cierres[1]["profit"] == -30.0
+    assert cierres[0]["precio_cierre"] == 2010.0
 
 
-def test_get_open_position_returns_none_without_open_positions(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_open_positions_returns_empty_list_without_open_positions(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeMt5()
     broker = connected_broker(monkeypatch, fake, dry_run=True)
 
-    assert broker.get_open_position("XAUUSD!") is None
+    assert broker.get_open_positions("XAUUSD!") == []
 
 
-def test_get_open_position_returns_details_of_our_own_position(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_open_positions_returns_details_of_each_own_position(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeMt5()
     fake.positiciones = [
         SimpleNamespace(
             symbol="XAUUSD!", magic=Mt5Broker.MAGIC, ticket=99, price_open=2000.0, sl=1990.0, tp=2020.0,
             price_current=2005.0, volume=0.1, type=FakeMt5.ORDER_TYPE_SELL,
-        )
+        ),
+        SimpleNamespace(
+            symbol="XAUUSD!", magic=Mt5Broker.MAGIC, ticket=100, price_open=2050.0, sl=2060.0, tp=2000.0,
+            price_current=2040.0, volume=0.05, type=FakeMt5.ORDER_TYPE_SELL,
+        ),
+        SimpleNamespace(
+            symbol="XAUUSD!", magic=999999, ticket=101, price_open=2000.0, sl=0.0, tp=0.0,
+            price_current=2000.0, volume=0.01, type=FakeMt5.ORDER_TYPE_BUY,
+        ),
     ]
     broker = connected_broker(monkeypatch, fake, dry_run=True)
 
-    posicion = broker.get_open_position("XAUUSD!")
+    posiciones = broker.get_open_positions("XAUUSD!")
 
-    assert posicion["ticket"] == 99
-    assert posicion["direccion"] == SignalDirection.SHORT
-    assert posicion["sl"] == 1990.0
+    assert len(posiciones) == 2  # la de otro magic number no cuenta
+    assert {p["ticket"] for p in posiciones} == {99, 100}
+    primera = next(p for p in posiciones if p["ticket"] == 99)
+    assert primera["direccion"] == SignalDirection.SHORT
+    assert primera["sl"] == 1990.0
 
 
 def test_update_stop_loss_in_dry_run_never_calls_order_send(monkeypatch: pytest.MonkeyPatch) -> None:

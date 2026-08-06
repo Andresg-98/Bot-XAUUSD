@@ -92,14 +92,12 @@ class FakeBroker:
     def __init__(
         self,
         equity: float = 10_000.0,
-        posiciones_abiertas: int = 0,
-        ultimo_cierre: dict | None = None,
-        posicion_abierta: dict | None = None,
+        posiciones: list[dict] | None = None,
+        cierres: list[dict] | None = None,
     ) -> None:
         self.equity = equity
-        self.posiciones_abiertas = posiciones_abiertas
-        self.ultimo_cierre = ultimo_cierre
-        self.posicion_abierta = posicion_abierta
+        self.posiciones = posiciones or []  # cada dict necesita al menos "ticket"
+        self.cierres = cierres or []  # cada dict necesita al menos "ticket_posicion"
         self.ordenes_enviadas: list = []
         self.sl_actualizados: list = []
 
@@ -107,13 +105,13 @@ class FakeBroker:
         return self.equity
 
     def get_open_positions_count(self, symbol: str) -> int:
-        return self.posiciones_abiertas
+        return len(self.posiciones)
 
-    def get_last_closed_trade(self, symbol, desde):
-        return self.ultimo_cierre
+    def get_open_positions(self, symbol: str) -> list[dict]:
+        return list(self.posiciones)
 
-    def get_open_position(self, symbol):
-        return self.posicion_abierta
+    def get_closed_trades_since(self, symbol: str, desde) -> list[dict]:
+        return list(self.cierres)
 
     def update_stop_loss(self, symbol, ticket, nuevo_sl, tp_actual) -> bool:
         self.sl_actualizados.append((ticket, nuevo_sl, tp_actual))
@@ -205,7 +203,9 @@ def test_signal_places_an_order_and_logs_it(tmp_path: Path) -> None:
 
 
 def test_open_position_blocks_new_entry(tmp_path: Path) -> None:
-    broker = FakeBroker(posiciones_abiertas=1)
+    # disparador de este ciclo es "cierre de vela H1" (no macro), así que con 1
+    # posición ya abierta, la 2a se bloquea (spec 4.5 ampliada)
+    broker = FakeBroker(posiciones=[{"ticket": 1}])
     kwargs = make_ciclo_kwargs(tmp_path, broker=broker)
 
     ejecutar_ciclo(**kwargs)
@@ -213,6 +213,46 @@ def test_open_position_blocks_new_entry(tmp_path: Path) -> None:
     assert broker.ordenes_enviadas == []
     registros = read_log(tmp_path / "decisiones.jsonl")
     assert any("posición abierta" in r.get("detalle", "") for r in registros)
+
+
+def test_second_position_opens_when_triggered_by_macro_event(tmp_path: Path) -> None:
+    # con 1 posición ya abierta, una 2a SÍ se permite si el disparador de este
+    # ciclo es un evento macro de alto impacto real
+    momento = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+    evento_alto_impacto = make_event("Federal Funds Rate", ImpactLevel.ALTO, valor_real=4.0, fecha=momento)
+    broker = FakeBroker(posiciones=[{"ticket": 1}])
+    loop_state = LoopState(ultima_hora_evaluada="2026-01-01T10")  # ya evaluado esta hora
+    kwargs = make_ciclo_kwargs(
+        tmp_path,
+        broker=broker,
+        loop_state=loop_state,
+        macro_client=FakeMacroClient(eventos=[evento_alto_impacto]),
+        momento=momento,
+    )
+
+    ejecutar_ciclo(**kwargs)
+
+    assert len(broker.ordenes_enviadas) == 1
+
+
+def test_third_position_never_opens_even_with_macro_event(tmp_path: Path) -> None:
+    momento = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+    evento_alto_impacto = make_event("Federal Funds Rate", ImpactLevel.ALTO, valor_real=4.0, fecha=momento)
+    broker = FakeBroker(posiciones=[{"ticket": 1}, {"ticket": 2}])
+    loop_state = LoopState(ultima_hora_evaluada="2026-01-01T10")
+    kwargs = make_ciclo_kwargs(
+        tmp_path,
+        broker=broker,
+        loop_state=loop_state,
+        macro_client=FakeMacroClient(eventos=[evento_alto_impacto]),
+        momento=momento,
+    )
+
+    ejecutar_ciclo(**kwargs)
+
+    assert broker.ordenes_enviadas == []
+    registros = read_log(tmp_path / "decisiones.jsonl")
+    assert any("máximo 2" in r.get("detalle", "") for r in registros)
 
 
 def test_permanent_halt_blocks_new_entries(tmp_path: Path) -> None:
@@ -356,8 +396,8 @@ def test_failed_macro_fetch_still_respects_the_throttle_window(tmp_path: Path) -
 
 def test_position_closure_is_logged_with_the_deal_details(tmp_path: Path) -> None:
     cierre = {"ticket_posicion": 123, "precio_cierre": 1990.0, "profit": -25.5, "volumen": 0.15}
-    broker = FakeBroker(posiciones_abiertas=0, ultimo_cierre=cierre)
-    loop_state = LoopState(posicion_abierta_anterior=True)  # ciclo anterior: sí había posición
+    broker = FakeBroker(posiciones=[], cierres=[cierre])
+    loop_state = LoopState(tickets_abiertos_anterior={123})  # ciclo anterior: sí había esa posición
     kwargs = make_ciclo_kwargs(tmp_path, broker=broker, loop_state=loop_state)
 
     ejecutar_ciclo(**kwargs)
@@ -367,30 +407,45 @@ def test_position_closure_is_logged_with_the_deal_details(tmp_path: Path) -> Non
     assert len(cierres_logueados) == 1
     assert "123" in cierres_logueados[0]["detalle"]
     assert "-25.50" in cierres_logueados[0]["detalle"]
-    assert loop_state.posicion_abierta_anterior is False
+    assert loop_state.tickets_abiertos_anterior == set()
 
 
 def test_no_closure_logged_when_position_stays_open(tmp_path: Path) -> None:
-    broker = FakeBroker(posiciones_abiertas=1)
-    loop_state = LoopState(posicion_abierta_anterior=True)
+    broker = FakeBroker(posiciones=[{"ticket": 42}])
+    loop_state = LoopState(tickets_abiertos_anterior={42})
     kwargs = make_ciclo_kwargs(tmp_path, broker=broker, loop_state=loop_state)
 
     ejecutar_ciclo(**kwargs)
 
     registros = read_log(tmp_path / "decisiones.jsonl")
     assert not any(r["tipo"] == "posicion_cerrada" for r in registros)
-    assert loop_state.posicion_abierta_anterior is True
+    assert loop_state.tickets_abiertos_anterior == {42}
 
 
 def test_no_closure_logged_when_there_was_no_previous_position(tmp_path: Path) -> None:
-    broker = FakeBroker(posiciones_abiertas=0)
-    loop_state = LoopState(posicion_abierta_anterior=False)
+    broker = FakeBroker(posiciones=[])
+    loop_state = LoopState(tickets_abiertos_anterior=set())
     kwargs = make_ciclo_kwargs(tmp_path, broker=broker, loop_state=loop_state)
 
     ejecutar_ciclo(**kwargs)
 
     registros = read_log(tmp_path / "decisiones.jsonl")
     assert not any(r["tipo"] == "posicion_cerrada" for r in registros)
+
+
+def test_only_the_closed_ticket_is_logged_when_one_of_two_positions_closes(tmp_path: Path) -> None:
+    cierre = {"ticket_posicion": 1, "precio_cierre": 1990.0, "profit": -25.5, "volumen": 0.15}
+    broker = FakeBroker(posiciones=[{"ticket": 2}], cierres=[cierre])  # el ticket 1 ya no está, el 2 sigue
+    loop_state = LoopState(tickets_abiertos_anterior={1, 2})
+    kwargs = make_ciclo_kwargs(tmp_path, broker=broker, loop_state=loop_state)
+
+    ejecutar_ciclo(**kwargs)
+
+    registros = read_log(tmp_path / "decisiones.jsonl")
+    cierres_logueados = [r for r in registros if r["tipo"] == "posicion_cerrada"]
+    assert len(cierres_logueados) == 1
+    assert "ticket=1" in cierres_logueados[0]["detalle"]
+    assert loop_state.tickets_abiertos_anterior == {2}
 
 
 # --- trailing stop (breakeven + ATR) -------------------------------------------------
@@ -403,14 +458,14 @@ def make_logger(tmp_path: Path) -> DecisionLogger:
 
 
 def test_trailing_disabled_does_nothing(tmp_path: Path) -> None:
-    broker = FakeBroker(posicion_abierta={"ticket": 1, "entrada": 2000, "sl": 1990, "tp": 2050, "precio_actual": 2050, "direccion": SignalDirection.LONG})
+    broker = FakeBroker(posiciones=[{"ticket": 1, "entrada": 2000, "sl": 1990, "tp": 2050, "precio_actual": 2050, "direccion": SignalDirection.LONG}])
     _actualizar_trailing_stop("XAUUSD!", broker, FakePriceClient(), RiskConfig(trailing_habilitado=False), make_logger(tmp_path), LoopState())
 
     assert broker.sl_actualizados == []
 
 
 def test_no_open_position_does_nothing(tmp_path: Path) -> None:
-    broker = FakeBroker(posicion_abierta=None)
+    broker = FakeBroker(posiciones=[])
     _actualizar_trailing_stop("XAUUSD!", broker, FakePriceClient(), TRAILING_RISK, make_logger(tmp_path), LoopState())
 
     assert broker.sl_actualizados == []
@@ -418,7 +473,7 @@ def test_no_open_position_does_nothing(tmp_path: Path) -> None:
 
 def test_long_below_activation_threshold_does_not_move_sl(tmp_path: Path) -> None:
     # riesgo inicial = 2000-1990 = 10; ganancia = 2005-2000 = 5 < 10 -> no se activa
-    broker = FakeBroker(posicion_abierta={"ticket": 1, "entrada": 2000, "sl": 1990, "tp": 2050, "precio_actual": 2005, "direccion": SignalDirection.LONG})
+    broker = FakeBroker(posiciones=[{"ticket": 1, "entrada": 2000, "sl": 1990, "tp": 2050, "precio_actual": 2005, "direccion": SignalDirection.LONG}])
     _actualizar_trailing_stop("XAUUSD!", broker, FakePriceClient(), TRAILING_RISK, make_logger(tmp_path), LoopState())
 
     assert broker.sl_actualizados == []
@@ -427,7 +482,7 @@ def test_long_below_activation_threshold_does_not_move_sl(tmp_path: Path) -> Non
 def test_long_past_activation_moves_sl_to_atr_trail(tmp_path: Path) -> None:
     # riesgo inicial=10; ganancia=15>=10 -> activado. ATR=2.0 (FakePriceClient) x1.5=3.0
     # candidato ATR = 2015-3=2012; candidato breakeven=2000; max(1990,2000,2012)=2012
-    broker = FakeBroker(posicion_abierta={"ticket": 7, "entrada": 2000, "sl": 1990, "tp": 2050, "precio_actual": 2015, "direccion": SignalDirection.LONG})
+    broker = FakeBroker(posiciones=[{"ticket": 7, "entrada": 2000, "sl": 1990, "tp": 2050, "precio_actual": 2015, "direccion": SignalDirection.LONG}])
     _actualizar_trailing_stop("XAUUSD!", broker, FakePriceClient(), TRAILING_RISK, make_logger(tmp_path), LoopState())
 
     assert broker.sl_actualizados == [(7, 2012.0, 2050)]
@@ -436,16 +491,28 @@ def test_long_past_activation_moves_sl_to_atr_trail(tmp_path: Path) -> None:
 def test_short_past_activation_moves_sl_down_to_atr_trail(tmp_path: Path) -> None:
     # riesgo inicial=10; ganancia=2000-1985=15>=10 -> activado. candidato ATR=1985+3=1988
     # candidato breakeven=2000; min(2010,2000,1988)=1988
-    broker = FakeBroker(posicion_abierta={"ticket": 9, "entrada": 2000, "sl": 2010, "tp": 1950, "precio_actual": 1985, "direccion": SignalDirection.SHORT})
+    broker = FakeBroker(posiciones=[{"ticket": 9, "entrada": 2000, "sl": 2010, "tp": 1950, "precio_actual": 1985, "direccion": SignalDirection.SHORT}])
     _actualizar_trailing_stop("XAUUSD!", broker, FakePriceClient(), TRAILING_RISK, make_logger(tmp_path), LoopState())
 
     assert broker.sl_actualizados == [(9, 1988.0, 1950)]
 
 
+def test_trailing_applies_independently_to_two_open_positions(tmp_path: Path) -> None:
+    broker = FakeBroker(
+        posiciones=[
+            {"ticket": 7, "entrada": 2000, "sl": 1990, "tp": 2050, "precio_actual": 2015, "direccion": SignalDirection.LONG},  # activa
+            {"ticket": 1, "entrada": 2000, "sl": 1990, "tp": 2050, "precio_actual": 2005, "direccion": SignalDirection.LONG},  # no activa
+        ]
+    )
+    _actualizar_trailing_stop("XAUUSD!", broker, FakePriceClient(), TRAILING_RISK, make_logger(tmp_path), LoopState())
+
+    assert broker.sl_actualizados == [(7, 2012.0, 2050)]  # solo la 7 se movió, la 1 no llegó al umbral
+
+
 def test_trailing_never_moves_sl_backwards(tmp_path: Path) -> None:
     # el SL actual (2012) ya está más protegido que lo que el trailing calcularía
     # de cero (2000 breakeven, o 2012 con ATR) -- no debe empeorarlo.
-    broker = FakeBroker(posicion_abierta={"ticket": 3, "entrada": 2000, "sl": 2012, "tp": 2050, "precio_actual": 2015, "direccion": SignalDirection.LONG})
+    broker = FakeBroker(posiciones=[{"ticket": 3, "entrada": 2000, "sl": 2012, "tp": 2050, "precio_actual": 2015, "direccion": SignalDirection.LONG}])
     _actualizar_trailing_stop("XAUUSD!", broker, FakePriceClient(), TRAILING_RISK, make_logger(tmp_path), LoopState())
 
     assert broker.sl_actualizados == []
@@ -453,17 +520,17 @@ def test_trailing_never_moves_sl_backwards(tmp_path: Path) -> None:
 
 def test_original_risk_distance_is_cached_not_recomputed_from_a_moved_sl(tmp_path: Path) -> None:
     loop_state = LoopState()
-    broker = FakeBroker(posicion_abierta={"ticket": 5, "entrada": 2000, "sl": 1990, "tp": 2050, "precio_actual": 2005, "direccion": SignalDirection.LONG})
+    broker = FakeBroker(posiciones=[{"ticket": 5, "entrada": 2000, "sl": 1990, "tp": 2050, "precio_actual": 2005, "direccion": SignalDirection.LONG}])
     _actualizar_trailing_stop("XAUUSD!", broker, FakePriceClient(), TRAILING_RISK, make_logger(tmp_path), loop_state)
-    assert loop_state.trailing_distancia_riesgo == 10.0
+    assert loop_state.trailing_distancia_riesgo_por_ticket[5] == 10.0
 
     # el broker ya movió el SL (como si un ciclo anterior lo hubiera hecho) —
     # la distancia de riesgo cacheada debe seguir siendo la original (10), no 5
-    broker.posicion_abierta["sl"] = 2000.0
-    broker.posicion_abierta["precio_actual"] = 2011.0  # ganancia=11 >= 10 (cacheada) -> se activa
+    broker.posiciones[0]["sl"] = 2000.0
+    broker.posiciones[0]["precio_actual"] = 2011.0  # ganancia=11 >= 10 (cacheada) -> se activa
     _actualizar_trailing_stop("XAUUSD!", broker, FakePriceClient(), TRAILING_RISK, make_logger(tmp_path), loop_state)
 
-    assert loop_state.trailing_distancia_riesgo == 10.0
+    assert loop_state.trailing_distancia_riesgo_por_ticket[5] == 10.0
 
 
 # --- FRED (VIX/DXY) y sentimiento de noticias (refuerzo de aversión al riesgo) -----------
